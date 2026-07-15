@@ -1,0 +1,23 @@
+# Build directories
+build/
+build-*/
+out/
+cmake-build-*/
+
+# IDE / tooling
+.vs/
+.vscode/
+.idea/
+*.user
+*.tuser
+.DS_Store
+.cache/
+
+# Compiled artifacts
+*.vst3
+*.component
+*.app
+*.exe
+*.pdb
+*.ilk
+*.obj
