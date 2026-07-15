@@ -1,6 +1,6 @@
 # PyMSS ARA Plugin
 
-An **ARA-enabled VST3 audio plugin** that performs **Music Source Separation** directly inside a DAW, powered by the Python [`pymss`](https://github.com/) package.
+An **ARA-enabled VST3 audio plugin** that performs **Music Source Separation** directly inside a DAW, powered by the Python [`pymss`](https://github.com/pymss-project/pymss) package.
 
 The plugin reads an entire ARA-assigned track, separates it into stems (vocals, drums, bass, etc.) on a background process running the pymss model, and lets you monitor each stem with per-track **mute / solo** — all without bouncing files or leaving the DAW.
 
@@ -20,7 +20,7 @@ The plugin reads an entire ARA-assigned track, separates it into stems (vocals, 
 ## Building
 
 ```bash
-git clone --recurse-submodules <repo-url> pymss-ara
+git clone --recurse-submodules https://github.com/pymss-project/pymss-ara
 cd pymss-ara
 
 # Configure (Visual Studio generator, x64)
