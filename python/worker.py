@@ -26,6 +26,7 @@ the stems as concatenated interleaved float32 PCM (one stem after another).
 from __future__ import annotations
 
 import json
+import math
 import os
 import struct
 import sys
@@ -34,6 +35,40 @@ import traceback
 from queue import Queue
 
 import numpy as np
+
+
+def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """Resample channel-major float audio without external DSP runtimes.
+
+    ARA hosts hand us whole media items, so conversion must work for buffers
+    containing many minutes of audio.  More importantly, REAPER launches this
+    worker after PyTorch/CUDA has loaded: importing/calling the native scipy
+    resampler in that process can deadlock in its OpenMP runtime.  This small
+    NumPy-only linear interpolator avoids scipy, librosa, and their native
+    thread pools entirely.  Its quality is sufficient for model-rate
+    conversion and the separator's own analysis filters.
+    """
+    if orig_sr == target_sr:
+        return np.ascontiguousarray(audio, dtype=np.float32)
+
+    source = np.ascontiguousarray(audio, dtype=np.float32)
+    source_frames = source.shape[-1]
+    # Match standard resamplers' convention: preserve the final partial output
+    # interval instead of dropping it when the ratio is non-integral.
+    output_frames = int(math.ceil(source_frames * target_sr / orig_sr))
+    if source_frames == 0 or output_frames == 0:
+        return np.empty((source.shape[0], 0), dtype=np.float32)
+
+    # np.interp is executed in NumPy's core and is independent of scipy/OpenMP.
+    # Keep a single position vector and handle each channel independently to
+    # avoid a large temporary (channels x frames) allocation.
+    source_positions = np.arange(output_frames, dtype=np.float64) * (orig_sr / target_sr)
+    source_positions[-1] = min(source_positions[-1], source_frames - 1)
+    source_indices = np.arange(source_frames, dtype=np.float64)
+    output = np.empty((source.shape[0], output_frames), dtype=np.float32)
+    for channel in range(source.shape[0]):
+        output[channel] = np.interp(source_positions, source_indices, source[channel]).astype(np.float32)
+    return output
 
 # -----------------------------------------------------------------------------
 # Framing helpers (binary, little-endian).
@@ -269,14 +304,13 @@ class Worker:
         model_sr = self._model_sample_rate(separator)
         input_sr = sample_rate
         if model_sr and model_sr != sample_rate:
-            import librosa
-            log(f"Resampling input {sample_rate} -> {model_sr}")
-            mix = np.ascontiguousarray(
-                librosa.resample(mix, orig_sr=sample_rate, target_sr=model_sr).astype(np.float32)
-            )
+            log(f"Resampling input {sample_rate} -> {model_sr} ({frames} frames)")
+            self._progress_callback(0, 1, "Resampling input for model...")
+            mix = resample_audio(mix, sample_rate, model_sr)
             input_sr = model_sr
 
-        log(f"Separating {frames} frames @ {input_sr} Hz, channels={channels}")
+        log(f"Separating {mix.shape[-1]} frames @ {input_sr} Hz, channels={channels}")
+        self._progress_callback(0, 1, "Running separation...")
         results = separator.separate(mix, pbar=False)
 
         # Order stems deterministically.
@@ -292,11 +326,7 @@ class Worker:
                 arr = arr[:, np.newaxis]          # (frames, 1)
             # arr is (frames, channels)
             if out_sr != sample_rate:
-                import librosa
-                arr = np.ascontiguousarray(
-                    librosa.resample(np.ascontiguousarray(arr.T), orig_sr=out_sr, target_sr=sample_rate)
-                    .T.astype(np.float32)
-                )
+                arr = resample_audio(arr.T, out_sr, sample_rate).T
             stem_arrays.append(arr)
 
         # Pack stems as concatenated interleaved float32 (f0c0, f0c1, f1c0, ...).

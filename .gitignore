@@ -3,6 +3,7 @@ build/
 build-*/
 out/
 cmake-build-*/
+__pycache__/
 
 # IDE / tooling
 .vs/
