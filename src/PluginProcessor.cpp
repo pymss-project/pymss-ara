@@ -30,6 +30,8 @@ PyMSSDocumentController* PyMSSProcessorImpl::getDC()
 
 juce::ARAAudioSource* PyMSSProcessorImpl::getPrimaryAudioSource()
 {
+    // A playback renderer is the most accurate way to identify the source for
+    // this plug-in instance, so use it whenever the host has supplied regions.
     if (auto* r = getPlaybackRenderer<PyMSSPlaybackRenderer>())
     {
         for (auto* playbackRegion : r->getPlaybackRegions())
@@ -39,6 +41,21 @@ juce::ARAAudioSource* PyMSSProcessorImpl::getPrimaryAudioSource()
                     return src;
         }
     }
+
+    // REAPER may bind an ARA processor and create its AudioSource before it
+    // creates/attaches the PlaybackRegion to the renderer.  In that interval
+    // getPlaybackRegions() is empty even though the ARA assignment is valid.
+    // The document model is already up to date, however.  Use its sole source
+    // as a fallback; deliberately do not guess when a document owns multiple
+    // sources, because that could process audio from a different track/item.
+    if (auto* dc = getDC())
+        if (auto* document = dc->getDocument())
+        {
+            const auto& sources = document->getAudioSources();
+            if (sources.size() == 1)
+                return sources.front();
+        }
+
     return nullptr;
 }
 
