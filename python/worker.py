@@ -127,11 +127,14 @@ class CancelledError(Exception):
 # -----------------------------------------------------------------------------
 
 class Worker:
-    """Holds long-lived state (loaded model) and dispatches commands."""
+    """Dispatches commands and owns cancellation/progress state.
+
+    Separators are intentionally short-lived: every separation request loads
+    its model, runs inference, then leaves the separator context and releases
+    model/GPU resources before the response is returned.
+    """
 
     def __init__(self) -> None:
-        self._separator = None
-        self._loaded_key: tuple | None = None  # (model_name, model_dir, inference_params_hash)
         self._cancel_event = threading.Event()
         self._job_id: int | None = None
         self._in_queue: Queue = Queue()
@@ -222,37 +225,17 @@ class Worker:
 
     # -- model loading --------------------------------------------------------
 
-    def _hash_params(self, params: dict) -> int:
-        return hash(tuple(sorted((k, str(v)) for k, v in (params or {}).items())))
-
-    def _ensure_model(self, model_name: str, model_dir: str | None, inference_params: dict):
+    def _create_separator(self, model_name: str, model_dir: str | None, inference_params: dict):
         from pymss import MSSeparator
 
-        key = (model_name, model_dir or "", self._hash_params(inference_params))
-        if self._separator is not None and self._loaded_key == key:
-            return self._separator
-
-        # Release the previous model before loading a new one.
-        if self._separator is not None:
-            try:
-                self._separator.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._separator = None
-
         log(f"Loading model {model_name!r} (model_dir={model_dir!r}, download=True)")
-        separator = MSSeparator.from_model_name(
+        return MSSeparator.from_model_name(
             model_name,
             model_dir=model_dir,
             download=True,
             progress_callback=self._progress_callback,
             inference_params=inference_params,
         )
-        separator.load_model()
-        self._separator = separator
-        self._loaded_key = key
-        log("Model loaded")
-        return separator
 
     # -- progress + cancellation glue ----------------------------------------
 
@@ -292,26 +275,31 @@ class Worker:
         self._cancel_event.clear()
         self._job_id = request_id
 
-        separator = self._ensure_model(model_name, model_dir, inference_params)
-
         # Decode interleaved float32 body -> (channels, frames).
         raw = np.frombuffer(body, dtype="<f4")
         frames = raw.size // max(1, channels)
         raw = raw[: frames * channels]
         mix = np.ascontiguousarray(raw.reshape(frames, channels).T.astype(np.float32))
 
-        # Resample input to the model's design sample rate if needed.
-        model_sr = self._model_sample_rate(separator)
-        input_sr = sample_rate
-        if model_sr and model_sr != sample_rate:
-            log(f"Resampling input {sample_rate} -> {model_sr} ({frames} frames)")
-            self._progress_callback(0, 1, "Resampling input for model...")
-            mix = resample_audio(mix, sample_rate, model_sr)
-            input_sr = model_sr
+        # A fresh separator is used for every request.  MSSeparator's context
+        # manager calls close() on exit, including when inference raises.
+        with self._create_separator(model_name, model_dir, inference_params) as separator:
+            log("Model loaded")
 
-        log(f"Separating {mix.shape[-1]} frames @ {input_sr} Hz, channels={channels}")
-        self._progress_callback(0, 1, "Running separation...")
-        results = separator.separate(mix, pbar=False)
+            # Resample input to the model's design sample rate if needed.
+            model_sr = self._model_sample_rate(separator)
+            input_sr = sample_rate
+            if model_sr and model_sr != sample_rate:
+                log(f"Resampling input {sample_rate} -> {model_sr} ({frames} frames)")
+                self._progress_callback(0, 1, "Resampling input for model...")
+                mix = resample_audio(mix, sample_rate, model_sr)
+                input_sr = model_sr
+
+            log(f"Separating {mix.shape[-1]} frames @ {input_sr} Hz, channels={channels}")
+            self._progress_callback(0, 1, "Running separation...")
+            results = separator.separate(mix, pbar=False)
+
+        log("Model released")
 
         # Order stems deterministically.
         stem_names = list(results.keys())
@@ -364,12 +352,9 @@ class Worker:
         log("Cancel requested")
 
     def shutdown(self) -> None:
-        if self._separator is not None:
-            try:
-                self._separator.close()
-            except Exception:  # noqa: BLE001
-                pass
-        self._separator = None
+        # Separators are scoped to individual separation requests, so there is
+        # no model instance to release when the worker exits.
+        return None
 
 
 # -----------------------------------------------------------------------------
