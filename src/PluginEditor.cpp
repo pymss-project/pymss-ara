@@ -1,5 +1,5 @@
 #include "PluginEditor.h"
-#include "Settings.h"
+#include "config/Settings.h"
 
 //==============================================================================
 namespace

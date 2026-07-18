@@ -3,9 +3,9 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_audio_formats/juce_audio_formats.h>
 
-#include "Settings.h"
-#include "WorkerClient.h"
-#include "SeparationEngine.h"
+#include "../config/Settings.h"
+#include "../ipc/WorkerClient.h"
+#include "../core/SeparationEngine.h"
 #include "PyMSSPlaybackRenderer.h"
 
 /** Central document controller specialisation.

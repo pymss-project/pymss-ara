@@ -6,7 +6,7 @@
 #include <map>
 #include <memory>
 
-#include "SeparationEngine.h"
+#include "../core/SeparationEngine.h"
 
 /** ARA playback renderer for a 1-in / 1-out (stereo) plugin.
 

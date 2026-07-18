@@ -3,7 +3,7 @@
 #include <juce_core/juce_core.h>
 #include <juce_data_structures/juce_data_structures.h>
 
-#include "Stems.h"
+#include "../core/Stems.h"
 #include "WorkerProtocol.h"
 
 /** Asynchronous client that talks to python/worker.py over a stdin/stdout

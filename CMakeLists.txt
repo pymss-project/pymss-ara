@@ -24,11 +24,11 @@ juce_set_ara_sdk_path("${CMAKE_CURRENT_SOURCE_DIR}/third_party/ARA_SDK")
 set(PYMSS_SOURCES
     src/PluginProcessor.cpp
     src/PluginEditor.cpp
-    src/PyMSSDocumentController.cpp
-    src/PyMSSPlaybackRenderer.cpp
-    src/Settings.cpp
-    src/WorkerClient.cpp
-    src/SeparationEngine.cpp
+    src/ara/PyMSSDocumentController.cpp
+    src/ara/PyMSSPlaybackRenderer.cpp
+    src/config/Settings.cpp
+    src/ipc/WorkerClient.cpp
+    src/core/SeparationEngine.cpp
 )
 
 # -----------------------------------------------------------------------------

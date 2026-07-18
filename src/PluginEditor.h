@@ -4,9 +4,9 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 
 #include "PluginProcessor.h"
-#include "WorkerClient.h"
-#include "Stems.h"
-#include "SeparationEngine.h"
+#include "ipc/WorkerClient.h"
+#include "core/Stems.h"
+#include "core/SeparationEngine.h"
 
 /** One row in the stem monitor: name + Mute + Solo. */
 class StemMixRow : public juce::Component

@@ -1,8 +1,8 @@
 #pragma once
 
 #include <juce_audio_processors/juce_audio_processors.h>
-#include "PyMSSDocumentController.h"
-#include "Stems.h"
+#include "ara/PyMSSDocumentController.h"
+#include "core/Stems.h"
 
 /** Helper accessors for the shared machinery living in the document controller.
     Returns nullptr if the plugin is not bound to ARA. */

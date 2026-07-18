@@ -9,7 +9,7 @@
 #include <functional>
 
 #include "Stems.h"
-#include "WorkerClient.h"
+#include "../ipc/WorkerClient.h"
 
 /** Orchestrates separation jobs on a background thread.
 
