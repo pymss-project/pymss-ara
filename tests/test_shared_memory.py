@@ -17,6 +17,163 @@ sys.path.insert(0, str(PROJECT_ROOT / "python"))
 import worker  # noqa: E402
 
 
+class WorkerLogicTests(unittest.TestCase):
+    def test_pymss_identity_is_embedded_in_shared_memory_header(self):
+        self.assertEqual(worker.CONTROL_PROTOCOL_VERSION, 4)
+        self.assertEqual(worker.SHARED_MEMORY_TRANSPORT, "pymss.shared_memory.audio.v2")
+        self.assertEqual(worker.SHM_MAGIC_BYTES, b"PYMS")
+        self.assertEqual(worker.SHM_IDENTITY.rstrip(b"\0"), b"PYMSS::SHM::V2")
+        self.assertEqual(worker._SHM_HEADER.size, worker.SHM_HEADER_BYTES)
+
+        header = bytearray(worker.SHM_HEADER_BYTES)
+        worker._write_mapping_header(
+            header,
+            role=worker.SHM_ROLE_INPUT,
+            request_id=9001,
+            payload_bytes=0,
+            frames=0,
+            channels=0,
+            state=worker.SHM_STATE_READY,
+        )
+        self.assertEqual(bytes(header[:4]), worker.SHM_MAGIC_BYTES)
+        self.assertEqual(bytes(header[48:64]), worker.SHM_IDENTITY)
+        worker._read_mapping_header(
+            header,
+            expected_role=worker.SHM_ROLE_INPUT,
+            expected_request_id=9001,
+        )
+
+        header[48] ^= 0x01
+        with self.assertRaisesRegex(ValueError, "protocol header is invalid"):
+            worker._read_mapping_header(
+                header,
+                expected_role=worker.SHM_ROLE_INPUT,
+                expected_request_id=9001,
+            )
+
+    def test_model_config_defaults_are_extracted_without_legacy_normalize(self):
+        config = {
+            "audio": {"chunk_size": 1000},
+            "inference": {
+                "batch_size": 3,
+                "num_overlap": 4,
+                "normalize": True,
+            },
+        }
+        defaults = worker.Worker._extract_default_params(config)
+        self.assertEqual(defaults["batch_size"], 3)
+        self.assertEqual(defaults["chunk_size"], 1000)
+        self.assertEqual(defaults["overlap_size"], 750)
+        self.assertTrue(defaults["standardize"])
+        self.assertFalse(defaults["normalize"])
+
+        config["inference"]["chunk_size"] = 800
+        compatible = worker.Worker._extract_default_params(config)
+        self.assertEqual(compatible["chunk_size"], 800)
+        self.assertEqual(compatible["overlap_size"], 600)
+
+        registered_chunk = worker.Worker._extract_default_params(
+            {"audio": {"chunk_size": 1000}, "inference": {"num_overlap": 4}},
+            {"chunk_size": 800},
+        )
+        self.assertEqual(registered_chunk["chunk_size"], 800)
+        self.assertEqual(registered_chunk["overlap_size"], 600)
+
+        overridden = worker.Worker._extract_default_params(
+            config,
+            {"overlap_size": 125, "normalize": True},
+        )
+        self.assertEqual(overridden["overlap_size"], 125)
+        self.assertTrue(overridden["normalize"])
+
+    def test_vr_model_defaults_and_overrides_are_extracted(self):
+        defaults = worker.Worker._extract_default_params(None, architecture="vr")
+        self.assertEqual(defaults["batch_size"], 2)
+        self.assertEqual(defaults["window_size"], 512)
+        self.assertEqual(defaults["aggression"], 5)
+        self.assertEqual(defaults["post_process_threshold"], 0.2)
+        self.assertFalse(defaults["enable_tta"])
+        self.assertFalse(defaults["high_end_process"])
+        self.assertFalse(defaults["enable_post_process"])
+
+        overridden = worker.Worker._extract_default_params(
+            None,
+            {
+                "batch_size": 4,
+                "window_size": 1024,
+                "aggression": 0,
+                "post_process_threshold": 0.35,
+                "enable_tta": True,
+                "high_end_process": True,
+                "enable_post_process": True,
+                "normalize": True,
+            },
+            architecture="vr",
+        )
+        self.assertEqual(overridden["batch_size"], 4)
+        self.assertEqual(overridden["window_size"], 1024)
+        self.assertEqual(overridden["aggression"], 0)
+        self.assertEqual(overridden["post_process_threshold"], 0.35)
+        self.assertTrue(overridden["enable_tta"])
+        self.assertTrue(overridden["high_end_process"])
+        self.assertTrue(overridden["enable_post_process"])
+        self.assertTrue(overridden["normalize"])
+
+    def test_model_download_reports_progress_and_returns_info(self):
+        import pymss
+
+        events = []
+        instance = worker.Worker()
+        original_download = pymss.download_model
+        original_write_frame = worker.write_frame
+        original_model_info = instance.model_info
+
+        def fake_download(model_name, model_dir=None, progress_callback=None, **kwargs):
+            self.assertEqual(model_name, "fixture.ckpt")
+            self.assertEqual(model_dir, "models")
+            progress_callback(25, 100, "Downloading fixture.ckpt")
+            progress_callback(100, 100, "Downloaded fixture.ckpt")
+
+        pymss.download_model = fake_download
+        worker.write_frame = lambda header, body=b"": events.append((header, body))
+        instance.model_info = lambda name, model_dir: {
+            "name": name,
+            "installed": True,
+            "default_params": {"batch_size": 2},
+        }
+        try:
+            info = instance.download_model(501, "fixture.ckpt", "models")
+        finally:
+            pymss.download_model = original_download
+            worker.write_frame = original_write_frame
+            instance.model_info = original_model_info
+
+        self.assertTrue(info["installed"])
+        self.assertEqual([event[0]["done"] for event in events], [25, 100])
+        self.assertTrue(all(event[0]["type"] == "download_progress" for event in events))
+
+    def test_uninstalled_catalog_model_reports_zero_defaults(self):
+        info = worker.Worker().model_info("logic_bs_roformer.ckpt", None)
+        self.assertTrue(info["found"])
+        if not info["installed"]:
+            self.assertEqual(
+                info["default_params"],
+                {
+                    "batch_size": 0,
+                    "overlap_size": 0,
+                    "chunk_size": 0,
+                    "window_size": 0,
+                    "aggression": 0,
+                    "post_process_threshold": 0.0,
+                    "enable_tta": False,
+                    "standardize": False,
+                    "high_end_process": False,
+                    "enable_post_process": False,
+                    "normalize": False,
+                },
+            )
+
+
 @unittest.skipUnless(sys.platform == "win32", "Windows named mappings are required")
 class SharedMemoryProtocolTests(unittest.TestCase):
     def create_input(self, request_id: int = 41):
@@ -206,7 +363,7 @@ finally:
             del owner_samples
             owner.close()
 
-    def test_worker_control_handshake_reports_protocol_v2(self):
+    def test_worker_control_handshake_reports_protocol_v4(self):
         process = subprocess.Popen(
             [sys.executable, str(PROJECT_ROOT / "python" / "worker.py")],
             stdin=subprocess.PIPE,
@@ -261,10 +418,15 @@ finally:
         header.update({
             "model": "transport-fixture",
             "model_dir": "",
-            "batch_size": 0,
-            "overlap_size": 0,
-            "chunk_size": 0,
-            "normalize": False,
+            "model_architecture": "vr",
+            "batch_size": 2,
+            "window_size": 1024,
+            "aggression": 0,
+            "post_process_threshold": 0.35,
+            "enable_tta": True,
+            "high_end_process": True,
+            "enable_post_process": True,
+            "normalize": True,
         })
 
         class Separator:
@@ -289,7 +451,15 @@ finally:
         separator = Separator()
         separator.test_case = self
         instance = worker.Worker()
-        instance._create_separator = lambda *args, **kwargs: separator
+        captured_params = {}
+
+        def create_separator(model_name, model_dir, inference_params):
+            self.assertEqual(model_name, "transport-fixture")
+            self.assertIsNone(model_dir)
+            captured_params.update(inference_params)
+            return separator
+
+        instance._create_separator = create_separator
         original_write_frame = worker.write_frame
         original_log = worker.log
         worker.write_frame = lambda *args, **kwargs: None
@@ -300,6 +470,19 @@ finally:
             self.assertEqual(body, b"")
             self.assertEqual(response["transport"], worker.SHARED_MEMORY_TRANSPORT)
             self.assertIn(105, instance._output_regions)
+            self.assertEqual(
+                captured_params,
+                {
+                    "batch_size": 2,
+                    "enable_tta": True,
+                    "normalize": True,
+                    "window_size": 1024,
+                    "aggression": 0,
+                    "high_end_process": True,
+                    "enable_post_process": True,
+                    "post_process_threshold": 0.35,
+                },
+            )
 
             output = response["output"]
             reader = mmap.mmap(

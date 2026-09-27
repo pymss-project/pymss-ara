@@ -12,8 +12,8 @@ The plugin reads an entire ARA-assigned track, separates it into stems (vocals, 
 - **Dry passthrough before separation** — the original track plays through immediately. Source-to-host sample-rate mismatch is handled with a streaming resampler, so pitch stays correct without changing the project rate.
 - **Background separation** — inference runs in a long-lived Python worker process (`pymss`), keeping the audio thread free. The UI never blocks.
 - **Stem monitor** — after separation, each stem is listed with **Mute** and **Solo** controls. The output bus is the live mix of the active stems.
-- **Model browser** — lists all models in the pymss catalog; already-installed models are listed first, uninstalled ones are auto-downloaded on use (`download=True`).
-- **Inference parameters** — `batch_size`, `overlap_size`, `chunk_size` (0 = use the model default), `normalize`.
+- **Model browser** — the main selector lists installed models only; a searchable, category-filtered download dialog lists missing models with progress reporting.
+- **Architecture-aware inference parameters** — MSS models expose batch/chunk/overlap, TTA, standardization, and output normalization. VR models expose batch/window/aggression, TTA, high-end reconstruction, mask post-processing, its threshold, and output normalization. Installed model defaults are loaded automatically.
 - **Progress + cancel** — real-time progress from the model, with a Cancel button that aborts the in-flight job.
 - **Persistent settings** — Python interpreter path and model directory are stored at `~/.pymss/settings/ara.json`.
 
@@ -75,8 +75,8 @@ The Python worker's stderr is redirected to `~/.pymss/logs/worker_stderr.txt` fo
 
 1. **Load the plugin as ARA** on an audio track in an ARA-capable host (e.g. Reaper, Studio One). Make sure to pick the `(ARA)` entry so the host assigns the region to the plugin.
 2. Open the plugin UI. Press **play** — you should hear the original track (dry passthrough).
-3. Pick a model from the dropdown. Uninstalled models are auto-downloaded when you separate.
-4. (Optional) Adjust inference parameters. `0` means "use the model default".
+3. Pick an installed model from the dropdown. Use **Models...** to browse and download missing models; completed downloads are added to the main selector automatically.
+4. (Optional) Adjust the architecture-specific inference parameters. MSS numeric fields use `0` for the model default; VR fields are populated from the model configuration or PyMSS runtime defaults.
 5. Click **Start Separation**. Watch the progress bar; you can **Cancel** at any time.
 6. When finished, the **Stems** panel lists each separated stem with **Mute (M)** and **Solo (S)** buttons. The output is the live mix of the active stems.
 
@@ -133,7 +133,7 @@ pymss-ara/
 
 ### IPC protocol
 
-Protocol v2 separates the control and audio data paths. Commands, progress and
+Protocol v4 separates the control and audio data paths. Commands, progress and
 errors use framed stdin/stdout messages (see [python/worker.py](python/worker.py)
 and [src/ipc/WorkerProtocol.h](src/ipc/WorkerProtocol.h)):
 
@@ -151,9 +151,14 @@ worker owns each output mapping until the client sends `release_buffer`.
 Mapping names include the process, request, and a random nonce so multiple
 plug-in instances can run in the same host without collisions.
 
-Requests: `ping`, `check_pymss`, `list_models`, `model_info`, `separate`,
-`cancel`, `release_buffer`, `shutdown`.
-Replies/events: `ready`, `result`, `progress`, `error`.
+The audio transport is identified as `pymss.shared_memory.audio.v2`. Each
+mapping header starts with the ASCII magic `PYMS` and carries the fixed identity
+marker `PYMSS::SHM::V2` in its reserved tail, allowing dumps and diagnostics to
+distinguish PyMSS audio mappings from unrelated shared memory.
+
+Requests: `ping`, `check_pymss`, `list_models`, `model_info`, `download_model`,
+`separate`, `cancel`, `release_buffer`, `shutdown`.
+Replies/events: `ready`, `result`, `progress`, `download_progress`, `error`.
 
 The transport checks mapping sizes, request IDs, channel counts, stem ranges,
 and protocol versions before exposing samples to either side. The maximum

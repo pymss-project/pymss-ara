@@ -32,19 +32,33 @@ struct ModelInfoDetail
     bool installed = false;
 };
 
-/** Inference parameters exposed in the UI. A value of 0 means "use the model
-    default", which the worker translates to None. */
+/** Inference parameters exposed in the UI. MSS numeric values use 0 for the
+    model default; VR values are populated from the model/runtime defaults. */
 struct SeparationParams
 {
+    bool isVrModel = false;
     int batchSize = 0;
     int overlapSize = 0;
     int chunkSize = 0;
+    int windowSize = 512;
+    int aggression = 5;
+    double postProcessThreshold = 0.2;
+    bool enableTta = false;
+    bool standardize = false;
+    bool highEndProcess = false;
+    bool enablePostProcess = false;
     bool normalize = false;
 
     bool operator== (const SeparationParams& o) const
     {
-        return batchSize == o.batchSize && overlapSize == o.overlapSize
-               && chunkSize == o.chunkSize && normalize == o.normalize;
+        return isVrModel == o.isVrModel && batchSize == o.batchSize
+               && overlapSize == o.overlapSize && chunkSize == o.chunkSize
+               && windowSize == o.windowSize && aggression == o.aggression
+               && postProcessThreshold == o.postProcessThreshold
+               && enableTta == o.enableTta && standardize == o.standardize
+               && highEndProcess == o.highEndProcess
+               && enablePostProcess == o.enablePostProcess
+               && normalize == o.normalize;
     }
 };
 

@@ -3,6 +3,8 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <juce_audio_processors/juce_audio_processors.h>
 
+#include <atomic>
+
 #include "PluginProcessor.h"
 #include "ipc/WorkerClient.h"
 #include "core/Stems.h"
@@ -45,6 +47,11 @@ public:
     void pymssCheckResult (int tag, bool ok, const juce::String& version, const juce::String& message) override;
     void modelListResult (int tag, const juce::Array<juce::var>& models) override;
     void modelInfoResult (int tag, const juce::var& info) override;
+    void modelInfoFailed (int tag, const juce::String& message) override;
+    void modelDownloadProgress (int tag, juce::int64 done, juce::int64 total,
+                                const juce::String& message) override;
+    void modelDownloadDone (int tag, const juce::String& modelName, const juce::var& info) override;
+    void modelDownloadFailed (int tag, const juce::String& message) override;
     void workerDied (const juce::String& reason) override;
 
     // SeparationEngine ChangeBroadcaster (message thread).
@@ -55,11 +62,17 @@ private:
 
     void openSettingsDialog();
     void onSettingsSaved (const juce::String& pythonPath, const juce::String& modelPath);
+    void openModelDownloadDialog();
+    void startModelDownload (const juce::String& modelName);
 
     void refreshModelList();
     void populateModelCombo (const juce::Array<juce::var>& models);
-    void onModelChanged();
-    void requestModelInfo (const juce::String& modelName);
+    void onModelChanged (bool applyDefaults = true);
+    void requestModelInfo (const juce::String& modelName, bool applyDefaults = true);
+    void applyModelInfo (const juce::var& info, bool applyDefaults = true);
+    void setInferenceParams (const SeparationParams& params);
+    void updateParameterControls (bool isVrModel);
+    bool isModelInstalled (const juce::String& modelName);
 
     void onStartButtonClicked();
     void updateStartButtonText();
@@ -71,6 +84,7 @@ private:
     PyMSSDocumentController* dc = nullptr;
 
     juce::Label titleLabel;
+    juce::TextButton modelsButton { "Models..." };
     juce::TextButton settingsButton { "Settings" };
     juce::Label modelLabel { {}, "Model" };
     juce::ComboBox modelCombo;
@@ -80,9 +94,17 @@ private:
     juce::Label batchLabel { {}, "batch_size" };
     juce::Label overlapLabel { {}, "overlap_size" };
     juce::Label chunkLabel { {}, "chunk_size" };
-    juce::TextEditor batchEdit, overlapEdit, chunkEdit;
+    juce::Label windowLabel { {}, "window_size" };
+    juce::Label aggressionLabel { {}, "aggression" };
+    juce::Label postProcessThresholdLabel { {}, "post_threshold" };
+    juce::TextEditor batchEdit, overlapEdit, chunkEdit, windowEdit, aggressionEdit, postProcessThresholdEdit;
+    juce::ToggleButton enableTtaToggle { "enable_tta" };
+    juce::ToggleButton standardizeToggle { "standardize" };
+    juce::ToggleButton highEndProcessToggle { "high_end_process" };
+    juce::ToggleButton enablePostProcessToggle { "post_process" };
     juce::ToggleButton normalizeToggle { "normalize" };
     juce::Label paramsHint { {}, "0 = use model default" };
+    bool currentModelIsVr = false;
 
     juce::TextButton startButton { "Start Separation" };
     double progressValue = 0.0;
@@ -97,15 +119,38 @@ private:
     // Cached worker results (guarded by lock; applied on the message thread).
     juce::CriticalSection cacheLock;
     juce::Array<juce::var> cachedModels;
-    bool hasCachedModels = false;
+    std::atomic<bool> hasCachedModels { false };
     juce::String cachedPymssMessage;
     bool cachedPymssOk = false;
     bool hasPymssCheck = false;
     bool modelsNeedRefresh = false;
     bool pymssNeedsApply = false;
-    int lastModelInfoTag = -1;
+    std::atomic<int> lastModelInfoTag { -1 };
+    juce::var cachedModelInfo;
+    juce::String cachedModelInfoError;
+    int cachedModelInfoTag = -1;
+    bool modelInfoNeedsApply = false;
+    bool modelInfoLoading = false; // message thread only
+    bool modelInfoShouldApplyDefaults = true; // message thread only
+    bool preserveParamsOnInitialSelection = false; // message thread only
+
+    std::atomic<int> activeDownloadTag { -1 };
+    bool downloadBusy = false;
+    juce::int64 cachedDownloadDone = 0;
+    juce::int64 cachedDownloadTotal = 0;
+    juce::String cachedDownloadMessage;
+    juce::String cachedDownloadModel;
+    juce::String cachedDownloadError;
+    juce::var cachedDownloadInfo;
+    bool downloadProgressNeedsApply = false;
+    bool downloadFinishedNeedsApply = false;
+    bool cachedDownloadSucceeded = false;
+    juce::String pendingDefaultsRefreshModel;
+    bool modelSelectionInitialized = false;
 
     juce::Component::SafePointer<juce::DialogWindow> settingsDialog;
+    juce::Component::SafePointer<juce::DialogWindow> modelDownloadDialog;
+    juce::Component::SafePointer<juce::Component> modelDownloadPanel;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PyMSSAudioProcessorEditor)
 };

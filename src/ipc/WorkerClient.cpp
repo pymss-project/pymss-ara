@@ -400,16 +400,32 @@ int WorkerClient::requestModelList (const juce::String& modelDir)
     return tag;
 }
 
-int WorkerClient::requestModelInfo (const juce::String& modelName, const juce::String& modelDir)
+bool WorkerClient::requestModelInfo (const int tag, const juce::String& modelName,
+                                     const juce::String& modelDir)
 {
-    auto tag = nextTag.fetch_add (1);
+    if (tag <= 0 || ! isReady() || modelName.isEmpty())
+        return false;
+
     auto h = pymss_protocol::makeHeader();
     h->setProperty ("id", tag);
     h->setProperty ("cmd", "model_info");
     h->setProperty ("model", modelName);
     h->setProperty ("model_dir", modelDir);
-    sendFrame (*h, nullptr, 0);
-    return tag;
+    return sendFrame (*h, nullptr, 0);
+}
+
+bool WorkerClient::requestModelDownload (const int tag, const juce::String& modelName,
+                                         const juce::String& modelDir)
+{
+    if (tag <= 0 || ! isReady() || modelName.isEmpty())
+        return false;
+
+    auto h = pymss_protocol::makeHeader();
+    h->setProperty ("id", tag);
+    h->setProperty ("cmd", "download_model");
+    h->setProperty ("model", modelName);
+    h->setProperty ("model_dir", modelDir);
+    return sendFrame (*h, nullptr, 0);
 }
 
 bool WorkerClient::requestSeparation (const int tag,
@@ -473,9 +489,17 @@ bool WorkerClient::requestSeparation (const int tag,
     h->setProperty ("transport", pymss_protocol::sharedMemoryTransport);
     h->setProperty ("model", model);
     h->setProperty ("model_dir", modelDir);
+    h->setProperty ("model_architecture", params.isVrModel ? "vr" : "mss");
     h->setProperty ("batch_size", params.batchSize);
     h->setProperty ("overlap_size", params.overlapSize);
     h->setProperty ("chunk_size", params.chunkSize);
+    h->setProperty ("window_size", params.windowSize);
+    h->setProperty ("aggression", params.aggression);
+    h->setProperty ("post_process_threshold", params.postProcessThreshold);
+    h->setProperty ("enable_tta", params.enableTta);
+    h->setProperty ("standardize", params.standardize);
+    h->setProperty ("high_end_process", params.highEndProcess);
+    h->setProperty ("enable_post_process", params.enablePostProcess);
     h->setProperty ("normalize", params.normalize);
 
     auto input = std::make_unique<juce::DynamicObject>();
@@ -811,10 +835,33 @@ void WorkerClient::handleFrame (const juce::var& header, const juce::MemoryBlock
         return;
     }
 
+    if (type == "download_progress")
+    {
+        const auto done = (juce::int64) header.getProperty ("done", 0);
+        const auto total = (juce::int64) header.getProperty ("total", 0);
+        const auto msg = header.getProperty ("message", "").toString();
+        listeners.call ([&] (Listener& l) { l.modelDownloadProgress (id, done, total, msg); });
+        return;
+    }
+
     if (type == "error")
     {
-        releasePendingInput (id);
         const auto errorType = header.getProperty ("error_type", "").toString();
+        if (errorType == "download_failed")
+        {
+            const auto msg = header.getProperty ("message", "Model download failed").toString();
+            listeners.call ([&] (Listener& l) { l.modelDownloadFailed (id, msg); });
+            return;
+        }
+
+        if (errorType == "model_info_failed")
+        {
+            const auto msg = header.getProperty ("message", "Could not load model information").toString();
+            listeners.call ([&] (Listener& l) { l.modelInfoFailed (id, msg); });
+            return;
+        }
+
+        releasePendingInput (id);
         const bool cancelled = errorType == "cancelled";
         const auto msg = header.getProperty ("message", "unknown error").toString();
         listeners.call ([&] (Listener& l) { l.separationFailed (id, msg, cancelled); });
@@ -874,6 +921,14 @@ void WorkerClient::handleFrame (const juce::var& header, const juce::MemoryBlock
                                     header.getProperty ("version", "").toString(),
                                     header.getProperty ("message", "").toString());
             });
+            return;
+        }
+
+        if (header.hasProperty ("downloaded_model"))
+        {
+            const auto modelName = header.getProperty ("downloaded_model", "").toString();
+            const auto info = header.getProperty ("info", juce::var());
+            listeners.call ([&] (Listener& l) { l.modelDownloadDone (id, modelName, info); });
             return;
         }
 

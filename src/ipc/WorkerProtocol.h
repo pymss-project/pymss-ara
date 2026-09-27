@@ -15,14 +15,14 @@
     bytes   bodyLen     optional raw binary payload
 
     Every header carries an integer "id" used to match responses to requests and
-    to attribute progress events. Protocol v2 transfers separation audio through
+    to attribute progress events. Protocol v4 transfers separation audio through
     named shared memory; pipe bodies are retained only for framing compatibility.
 */
 
 namespace pymss_protocol
 {
 inline constexpr auto controlProtocolVersion = pymss_shm::controlProtocolVersion;
-inline constexpr const char* sharedMemoryTransport = "shared_memory_v1";
+inline constexpr const char* sharedMemoryTransport = "pymss.shared_memory.audio.v2";
 
 using Header = juce::DynamicObject;     // a JSON object
 using HeaderPtr = juce::ReferenceCountedObjectPtr<Header>;

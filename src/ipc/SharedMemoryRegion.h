@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -7,9 +8,12 @@
 
 namespace pymss_shm
 {
-constexpr std::uint32_t controlProtocolVersion = 2;
-constexpr std::uint32_t mappingMagic = 0x4d48534d; // "MSHM" in little-endian byte order.
-constexpr std::uint32_t mappingProtocolVersion = 1;
+constexpr std::uint32_t controlProtocolVersion = 4;
+constexpr std::uint32_t mappingMagic = 0x534d5950; // "PYMS" in little-endian byte order.
+constexpr std::uint32_t mappingProtocolVersion = 2;
+inline constexpr std::array<std::uint8_t, 16> mappingIdentity {
+    'P', 'Y', 'M', 'S', 'S', ':', ':', 'S', 'H', 'M', ':', ':', 'V', '2', 0, 0
+};
 constexpr std::uint64_t headerBytes = 64;
 constexpr std::uint64_t maxMappingBytes = 8ull * 1024ull * 1024ull * 1024ull;
 constexpr std::uint64_t maxResultPayloadBytes = 2ull * 1024ull * 1024ull * 1024ull;

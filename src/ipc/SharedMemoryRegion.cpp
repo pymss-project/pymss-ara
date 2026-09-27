@@ -29,6 +29,7 @@ constexpr std::size_t payloadBytesOffset = 24;
 constexpr std::size_t framesOffset = 32;
 constexpr std::size_t channelsOffset = 40;
 constexpr std::size_t stateOffset = 44;
+constexpr std::size_t identityOffset = 48;
 
 void writeU32 (void* base, const std::size_t offset, const std::uint32_t value) noexcept
 {
@@ -310,6 +311,8 @@ bool writeHeader (void* mapping,
     writeU64 (mapping, framesOffset, frames);
     writeU32 (mapping, channelsOffset, channels);
     writeU32 (mapping, stateOffset, static_cast<std::uint32_t> (state));
+    std::memcpy (static_cast<std::uint8_t*> (mapping) + identityOffset,
+                 mappingIdentity.data(), mappingIdentity.size());
     error.clear();
     return true;
 }
@@ -343,7 +346,9 @@ bool readAndValidateHeader (const void* mapping,
 
     if (readU32 (mapping, magicOffset) != mappingMagic
         || readU32 (mapping, versionOffset) != mappingProtocolVersion
-        || readU32 (mapping, headerSizeOffset) != headerBytes)
+        || readU32 (mapping, headerSizeOffset) != headerBytes
+        || std::memcmp (static_cast<const std::uint8_t*> (mapping) + identityOffset,
+                        mappingIdentity.data(), mappingIdentity.size()) != 0)
     {
         error = "Shared memory protocol header is invalid";
         return false;

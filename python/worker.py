@@ -14,11 +14,11 @@ Frame layout (little-endian, identical in both directions)::
 Request header fields:
     id      int    request id (mirrored in responses/progress)
     cmd     str    "ping" | "check_pymss" | "list_models" | "model_info"
-                   | "separate" | "cancel" | "shutdown"
+                   | "download_model" | "separate" | "cancel" | "shutdown"
 
 Response / event header fields:
     id      int
-    type    str    "result" | "progress" | "error"
+    type    str    "result" | "progress" | "download_progress" | "error"
 
 The "separate" request and result describe planar float32 named mappings. The
 mapping owner keeps each region alive until the peer has completed its access.
@@ -44,10 +44,12 @@ import numpy as np
 # Shared-memory protocol. Keep these values in sync with SharedMemoryRegion.h.
 # -----------------------------------------------------------------------------
 
-CONTROL_PROTOCOL_VERSION = 2
-SHARED_MEMORY_TRANSPORT = "shared_memory_v1"
-SHM_MAGIC = 0x4D48534D
-SHM_PROTOCOL_VERSION = 1
+CONTROL_PROTOCOL_VERSION = 4
+SHARED_MEMORY_TRANSPORT = "pymss.shared_memory.audio.v2"
+SHM_MAGIC_BYTES = b"PYMS"
+SHM_MAGIC = int.from_bytes(SHM_MAGIC_BYTES, "little")
+SHM_PROTOCOL_VERSION = 2
+SHM_IDENTITY = b"PYMSS::SHM::V2\0\0"
 SHM_HEADER_BYTES = 64
 SHM_MAX_BYTES = 8 * 1024 * 1024 * 1024
 SHM_MAX_RESULT_BYTES = 2 * 1024 * 1024 * 1024
@@ -57,7 +59,7 @@ SHM_ROLE_INPUT = 1
 SHM_ROLE_OUTPUT = 2
 SHM_STATE_WRITING = 1
 SHM_STATE_READY = 2
-_SHM_HEADER = struct.Struct("<IIIIQQQII16x")
+_SHM_HEADER = struct.Struct("<IIIIQQQII16s")
 
 _MAX_CONTROL_HEADER_BYTES = 8 * 1024 * 1024
 _MAX_CONTROL_BODY_BYTES = 1024 * 1024
@@ -106,6 +108,7 @@ def _write_mapping_header(shared: mmap.mmap, *, role: int, request_id: int,
         frames,
         channels,
         state,
+        SHM_IDENTITY,
     )
 
 
@@ -113,10 +116,11 @@ def _read_mapping_header(shared: mmap.mmap, *, expected_role: int,
                          expected_request_id: int) -> dict:
     if len(shared) < SHM_HEADER_BYTES:
         raise ValueError("shared memory mapping is smaller than its header")
-    magic, version, header_bytes, role, request_id, payload_bytes, frames, channels, state = (
+    magic, version, header_bytes, role, request_id, payload_bytes, frames, channels, state, identity = (
         _SHM_HEADER.unpack_from(shared, 0)
     )
-    if magic != SHM_MAGIC or version != SHM_PROTOCOL_VERSION or header_bytes != SHM_HEADER_BYTES:
+    if (magic != SHM_MAGIC or version != SHM_PROTOCOL_VERSION
+            or header_bytes != SHM_HEADER_BYTES or identity != SHM_IDENTITY):
         raise ValueError("shared memory protocol header is invalid")
     if role != expected_role or request_id != expected_request_id:
         raise ValueError("shared memory mapping does not match the request")
@@ -473,10 +477,16 @@ class Worker:
 
         installed = False
         local_paths: dict = {}
+        default_params = self._empty_default_params()
+        config_error = ""
         try:
             resolved = resolve_model(entry.name, model_dir=model_dir, require_supported=True, require_exists=True)
             installed = True
             local_paths = {"model_path": resolved.get("model_path"), "config_path": resolved.get("config_path")}
+            try:
+                default_params = self._read_model_defaults(resolved, entry.architecture)
+            except Exception as exc:  # noqa: BLE001
+                config_error = f"{type(exc).__name__}: {exc}"
         except Exception:  # noqa: BLE001
             installed = False
 
@@ -487,14 +497,18 @@ class Worker:
             pieces.append(f"Category: {entry.category_path}")
         if entry.target_stem:
             pieces.append(f"Target stem: {entry.target_stem}")
-        if entry.config_instruments:
-            pieces.append(f"Instruments: {entry.config_instruments}")
-        if entry.classification_basis:
-            pieces.append(f"Notes: {entry.classification_basis}")
+        config_instruments = getattr(entry, "config_instruments", None)
+        classification_basis = getattr(entry, "classification_basis", None)
+        if config_instruments:
+            pieces.append(f"Instruments: {config_instruments}")
+        if classification_basis:
+            pieces.append(f"Notes: {classification_basis}")
         if entry.size_bytes:
             pieces.append(f"Size: {entry.size_bytes / (1024 * 1024):.1f} MB")
         pieces.append(f"Supported: {'yes' if entry.supported else 'no'}")
         pieces.append(f"Installed locally: {'yes' if installed else 'no (will auto-download)'}")
+        if config_error:
+            pieces.append(f"Configuration defaults unavailable: {config_error}")
 
         return {
             "found": True,
@@ -503,11 +517,172 @@ class Worker:
             "architecture": entry.architecture,
             "category": entry.category_path,
             "target_stem": entry.target_stem,
-            "instruments": entry.config_instruments,
+            "instruments": config_instruments,
             "installed": installed,
             "intro": "\n".join(pieces),
             "local_paths": local_paths,
+            "default_params": default_params,
         }
+
+    @staticmethod
+    def _empty_default_params() -> dict:
+        return {
+            "batch_size": 0,
+            "overlap_size": 0,
+            "chunk_size": 0,
+            "window_size": 0,
+            "aggression": 0,
+            "post_process_threshold": 0.0,
+            "enable_tta": False,
+            "standardize": False,
+            "high_end_process": False,
+            "enable_post_process": False,
+            "normalize": False,
+        }
+
+    @staticmethod
+    def _section(config, name: str):
+        if config is None:
+            return {}
+        if hasattr(config, "get"):
+            return config.get(name, {}) or {}
+        return getattr(config, name, {}) or {}
+
+    @staticmethod
+    def _value(section, name: str, default=None):
+        if hasattr(section, "get"):
+            return section.get(name, default)
+        return getattr(section, name, default)
+
+    @staticmethod
+    def _integer_default(value, *, allow_zero: bool = False) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 0
+        if parsed < 0 or (parsed == 0 and not allow_zero):
+            return 0
+        return parsed
+
+    @staticmethod
+    def _float_default(value, default: float = 0.0) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed >= 0.0 else default
+
+    @staticmethod
+    def _boolean_default(value, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "yes", "on", "1"}:
+                return True
+            if normalized in {"false", "no", "off", "0", ""}:
+                return False
+        return bool(value)
+
+    @classmethod
+    def _extract_default_params(cls, config, resolved_params: dict | None = None,
+                                architecture: str | None = None) -> dict:
+        inference = cls._section(config, "inference")
+        audio = cls._section(config, "audio")
+        overrides = dict(resolved_params or {})
+        is_vr = str(architecture or "").lower() == "vr"
+        defaults = cls._empty_default_params()
+
+        if is_vr:
+            defaults.update({
+                "batch_size": cls._integer_default(cls._value(inference, "batch_size", 2)) or 2,
+                "window_size": cls._integer_default(cls._value(inference, "window_size", 512)) or 512,
+                "aggression": cls._integer_default(
+                    cls._value(inference, "aggression", 5), allow_zero=True),
+                "post_process_threshold": cls._float_default(
+                    cls._value(inference, "post_process_threshold", 0.2), 0.2),
+                "enable_tta": cls._boolean_default(cls._value(inference, "enable_tta", False)),
+                "high_end_process": cls._boolean_default(
+                    cls._value(inference, "high_end_process", False)),
+                "enable_post_process": cls._boolean_default(
+                    cls._value(inference, "enable_post_process", False)),
+            })
+        else:
+            batch_size = cls._integer_default(cls._value(inference, "batch_size"))
+            inference_chunk_size = cls._value(inference, "chunk_size")
+            chunk_size = cls._integer_default(
+                inference_chunk_size if inference_chunk_size is not None
+                else cls._value(audio, "chunk_size")
+            )
+            if overrides.get("chunk_size") is not None:
+                chunk_size = cls._integer_default(overrides["chunk_size"])
+
+            overlap_value = (
+                overrides["overlap_size"]
+                if overrides.get("overlap_size") is not None
+                else cls._value(inference, "overlap_size")
+            )
+            if overlap_value is None and chunk_size > 0:
+                num_overlap = cls._integer_default(cls._value(inference, "num_overlap"))
+                if num_overlap > 0:
+                    overlap_value = chunk_size - chunk_size // num_overlap
+            defaults.update({
+                "batch_size": batch_size,
+                "overlap_size": cls._integer_default(overlap_value, allow_zero=True),
+                "chunk_size": chunk_size,
+                "enable_tta": cls._boolean_default(cls._value(inference, "enable_tta", False)),
+                # MSS YAML inference.normalize is legacy input standardization.
+                "standardize": cls._boolean_default(cls._value(inference, "normalize", False)),
+            })
+
+        integer_keys = ["batch_size"]
+        if is_vr:
+            integer_keys.extend(["window_size", "aggression"])
+        for key in integer_keys:
+            if overrides.get(key) is not None:
+                defaults[key] = cls._integer_default(
+                    overrides[key], allow_zero=(key == "aggression"))
+
+        for key in ["enable_tta", "standardize", "high_end_process", "enable_post_process"]:
+            if overrides.get(key) is not None:
+                defaults[key] = cls._boolean_default(overrides[key])
+        if overrides.get("post_process_threshold") is not None:
+            defaults["post_process_threshold"] = cls._float_default(
+                overrides["post_process_threshold"], 0.2)
+        # Public pymss "normalize" controls output peak normalization.
+        if overrides.get("normalize") is not None:
+            defaults["normalize"] = cls._boolean_default(overrides["normalize"])
+        return defaults
+
+    @classmethod
+    def _read_model_defaults(cls, resolved: dict, architecture: str | None = None) -> dict:
+        config = None
+        config_path = resolved.get("config_path")
+        if config_path:
+            from pymss.config import load_config
+
+            config = load_config(config_path)
+        return cls._extract_default_params(
+            config, resolved.get("inference_params"), architecture=architecture)
+
+    def download_model(self, request_id: int, model_name: str, model_dir: str | None) -> dict:
+        from pymss import download_model
+
+        def report(done, total, message):
+            write_frame({
+                "id": request_id,
+                "type": "download_progress",
+                "done": int(done),
+                "total": int(total),
+                "message": str(message or ""),
+            })
+
+        download_model(
+            model_name,
+            model_dir=model_dir,
+            progress_callback=report,
+        )
+        return self.model_info(model_name, model_dir)
 
     # -- model loading --------------------------------------------------------
 
@@ -520,6 +695,7 @@ class Worker:
             model_dir=model_dir,
             download=True,
             progress_callback=self._progress_callback,
+            use_tta=bool(inference_params.get("enable_tta", False)),
             inference_params=inference_params,
         )
 
@@ -554,12 +730,32 @@ class Worker:
         def _to_none_if_zero(v):
             return None if (v is None or int(v) <= 0) else int(v)
 
+        is_vr = str(header.get("model_architecture", "")).lower() == "vr"
         inference_params = {
             "batch_size": _to_none_if_zero(header.get("batch_size", 0)),
-            "overlap_size": _to_none_if_zero(header.get("overlap_size", 0)),
-            "chunk_size": _to_none_if_zero(header.get("chunk_size", 0)),
+            "enable_tta": bool(header.get("enable_tta", False)),
             "normalize": bool(header.get("normalize", False)),
         }
+        if is_vr:
+            aggression = int(header.get("aggression", 5))
+            post_process_threshold = float(header.get("post_process_threshold", 0.2))
+            if aggression < 0 or aggression > 100:
+                raise ValueError("aggression must be between 0 and 100")
+            if post_process_threshold < 0.0 or post_process_threshold > 1.0:
+                raise ValueError("post_process_threshold must be between 0 and 1")
+            inference_params.update({
+                "window_size": _to_none_if_zero(header.get("window_size", 512)),
+                "aggression": aggression,
+                "high_end_process": bool(header.get("high_end_process", False)),
+                "enable_post_process": bool(header.get("enable_post_process", False)),
+                "post_process_threshold": post_process_threshold,
+            })
+        else:
+            inference_params.update({
+                "overlap_size": _to_none_if_zero(header.get("overlap_size", 0)),
+                "chunk_size": _to_none_if_zero(header.get("chunk_size", 0)),
+                "standardize": bool(header.get("standardize", False)),
+            })
 
         self._job_id = request_id
         self._discard_stale_cancellations(request_id)
@@ -759,9 +955,33 @@ def main() -> int:
             try:
                 result = worker.model_info(header.get("model"), header.get("model_dir"))
             except Exception as exc:  # noqa: BLE001
-                write_frame({"id": request_id, "type": "error", "message": _format_exc(exc)})
+                write_frame({
+                    "id": request_id,
+                    "type": "error",
+                    "error_type": "model_info_failed",
+                    "message": _format_exc(exc),
+                })
                 continue
             write_frame({"id": request_id, "type": "result", **result})
+            continue
+
+        if cmd == "download_model":
+            try:
+                model_name = header.get("model")
+                info = worker.download_model(request_id, model_name, header.get("model_dir") or None)
+                write_frame({
+                    "id": request_id,
+                    "type": "result",
+                    "downloaded_model": model_name,
+                    "info": info,
+                })
+            except Exception as exc:  # noqa: BLE001
+                write_frame({
+                    "id": request_id,
+                    "type": "error",
+                    "error_type": "download_failed",
+                    "message": _format_exc(exc),
+                })
             continue
 
         if cmd == "separate":

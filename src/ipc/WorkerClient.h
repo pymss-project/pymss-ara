@@ -37,6 +37,14 @@ public:
 
         virtual void modelInfoResult (int, const juce::var&) {}
 
+        virtual void modelInfoFailed (int, const juce::String&) {}
+
+        virtual void modelDownloadProgress (int, juce::int64, juce::int64, const juce::String&) {}
+
+        virtual void modelDownloadDone (int, const juce::String&, const juce::var&) {}
+
+        virtual void modelDownloadFailed (int, const juce::String&) {}
+
         virtual void separationProgress (int, int, int, const juce::String&) {}
 
         virtual void separationDone (int, std::shared_ptr<StemSet>) {}
@@ -76,7 +84,8 @@ public:
 
     int checkPymss();
     int requestModelList (const juce::String& modelDir);
-    int requestModelInfo (const juce::String& modelName, const juce::String& modelDir);
+    bool requestModelInfo (int tag, const juce::String& modelName, const juce::String& modelDir);
+    bool requestModelDownload (int tag, const juce::String& modelName, const juce::String& modelDir);
 
     /** Reserve a request tag so listeners can publish it before any response
         can arrive from the worker. */

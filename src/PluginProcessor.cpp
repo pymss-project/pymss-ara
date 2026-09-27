@@ -112,9 +112,17 @@ void PyMSSProcessorImpl::getStateInformation (juce::MemoryBlock& destData)
 {
     auto obj = std::make_unique<juce::DynamicObject>();
     obj->setProperty ("model", selectedModel);
+    obj->setProperty ("is_vr_model", params.isVrModel);
     obj->setProperty ("batch_size", params.batchSize);
     obj->setProperty ("overlap_size", params.overlapSize);
     obj->setProperty ("chunk_size", params.chunkSize);
+    obj->setProperty ("window_size", params.windowSize);
+    obj->setProperty ("aggression", params.aggression);
+    obj->setProperty ("post_process_threshold", params.postProcessThreshold);
+    obj->setProperty ("enable_tta", params.enableTta);
+    obj->setProperty ("standardize", params.standardize);
+    obj->setProperty ("high_end_process", params.highEndProcess);
+    obj->setProperty ("enable_post_process", params.enablePostProcess);
     obj->setProperty ("normalize", params.normalize);
     destData.setSize (0);
     juce::MemoryOutputStream (destData, true).writeText (
@@ -130,9 +138,17 @@ void PyMSSProcessorImpl::setStateInformation (const void* data, int size)
     if (auto parsed = juce::JSON::parse (text); parsed.isObject())
     {
         selectedModel = parsed.getProperty ("model", "").toString();
+        params.isVrModel = (bool) parsed.getProperty ("is_vr_model", false);
         params.batchSize = (int) parsed.getProperty ("batch_size", 0);
         params.overlapSize = (int) parsed.getProperty ("overlap_size", 0);
         params.chunkSize = (int) parsed.getProperty ("chunk_size", 0);
+        params.windowSize = (int) parsed.getProperty ("window_size", 512);
+        params.aggression = (int) parsed.getProperty ("aggression", 5);
+        params.postProcessThreshold = (double) parsed.getProperty ("post_process_threshold", 0.2);
+        params.enableTta = (bool) parsed.getProperty ("enable_tta", false);
+        params.standardize = (bool) parsed.getProperty ("standardize", false);
+        params.highEndProcess = (bool) parsed.getProperty ("high_end_process", false);
+        params.enablePostProcess = (bool) parsed.getProperty ("enable_post_process", false);
         params.normalize = (bool) parsed.getProperty ("normalize", false);
     }
 }
