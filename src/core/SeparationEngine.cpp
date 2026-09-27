@@ -1,5 +1,7 @@
 #include "SeparationEngine.h"
 
+#include <chrono>
+
 SeparationEngine::SeparationEngine (WorkerClient& clientToUse)
     : juce::Thread ("pymss-separation"), worker (clientToUse)
 {
@@ -106,9 +108,9 @@ bool SeparationEngine::requestSeparation (SourceReader sourceReader,
 void SeparationEngine::cancel()
 {
     cancelRequested = true;
-    if (pendingTag.load() >= 0)
-        worker.cancelSeparation();
-    resultEvent.signal();
+    const auto tag = pendingTag.load();
+    if (tag >= 0)
+        worker.cancelSeparation ((int) tag);
 }
 
 float SeparationEngine::getProgress() const
@@ -206,7 +208,7 @@ void SeparationEngine::separationDone (int tag, std::shared_ptr<StemSet> stems)
 
 void SeparationEngine::separationFailed (int tag, const juce::String& message, bool cancelled)
 {
-    if (tag != pendingTag.load() && ! cancelled)
+    if (tag != pendingTag.load())
         return;
 
     {
@@ -229,14 +231,70 @@ void SeparationEngine::separationFailed (int tag, const juce::String& message, b
     sendChangeMessage();
 }
 
+void SeparationEngine::workerReady (const bool pymssOk, const juce::String&, const juce::String& message)
+{
+    const auto currentState = state.load();
+    if (! pymssOk)
+    {
+        {
+            juce::ScopedLock el (errorLock);
+            errorMessage = "Python worker is available but pymss could not be loaded: " + message;
+        }
+        state = State::failed;
+        statusMessage = setStaticStatus ("Failed").toRawUTF8();
+        sendChangeMessage();
+        return;
+    }
+
+    if (currentState == State::restarting)
+    {
+        state = State::cancelled;
+        statusMessage = setStaticStatus ("Cancelled").toRawUTF8();
+    }
+    else if (currentState == State::failed && pendingTag.load() < 0)
+    {
+        {
+            juce::ScopedLock el (errorLock);
+            errorMessage.clear();
+        }
+        state = State::idle;
+        statusMessage = setStaticStatus ("Idle").toRawUTF8();
+    }
+
+    if (currentState == State::restarting || currentState == State::failed)
+        sendChangeMessage();
+}
+
 void SeparationEngine::workerDied (const juce::String& reason)
 {
     // If a separation is in flight, fail it so the engine thread doesn't hang.
     const auto tag = pendingTag.load();
     if (tag < 0)
+    {
+        if (state.load() == State::restarting)
+        {
+            {
+                juce::ScopedLock el (errorLock);
+                errorMessage = "Python worker restart failed: " + reason;
+            }
+            state = State::failed;
+            statusMessage = setStaticStatus ("Failed").toRawUTF8();
+            sendChangeMessage();
+        }
+        else
+        {
+            {
+                juce::ScopedLock el (errorLock);
+                errorMessage = "Python worker stopped: " + reason;
+            }
+            state = State::failed;
+            statusMessage = setStaticStatus ("Failed").toRawUTF8();
+            sendChangeMessage();
+        }
         return;
+    }
 
-    separationFailed (tag, "Worker process stopped: " + reason, false);
+    separationFailed (static_cast<int> (tag), "Worker process stopped: " + reason, false);
 }
 
 //==============================================================================
@@ -268,6 +326,16 @@ void SeparationEngine::run()
         job = *currentJob;
     }
 
+    if (! worker.isReady())
+    {
+        juce::ScopedLock el (errorLock);
+        errorMessage = "Python worker is not ready. Check the python_path setting and that pymss is installed.";
+        state = State::failed;
+        statusMessage = setStaticStatus ("Failed").toRawUTF8();
+        sendChangeMessage();
+        return;
+    }
+
     // 1) Read the ARA audio source.
     juce::AudioBuffer<float> sourceAudio;
     double nativeSR = 0.0;
@@ -297,10 +365,10 @@ void SeparationEngine::run()
     if (targetSR > 0 && std::abs (targetSR - nativeSR) > 0.5)
         sourceAudio = resampleBuffer (sourceAudio, nativeSR, targetSR);
 
-    if (! worker.isRunning())
+    if (! worker.isReady())
     {
         juce::ScopedLock el (errorLock);
-        errorMessage = "Python worker is not running. Check the python_path setting and that pymss is installed.";
+        errorMessage = "Python worker became unavailable while preparing the separation request.";
         state = State::failed;
         statusMessage = setStaticStatus ("Failed").toRawUTF8();
         sendChangeMessage();
@@ -313,12 +381,18 @@ void SeparationEngine::run()
     sendChangeMessage();
 
     resultEvent.reset();
-    const int tag = worker.requestSeparation (job.model, job.modelDir, job.params,
-                                              sourceAudio, targetSR, sourceAudio.getNumChannels());
+    const int tag = worker.reserveRequestTag();
     pendingTag = tag;
+    if (cancelRequested.load())
+        worker.cancelSeparation (tag);
+    const bool requestSent = worker.requestSeparation (tag,
+                                                       job.model, job.modelDir, job.params,
+                                                       sourceAudio, targetSR,
+                                                       sourceAudio.getNumChannels());
 
-    if (tag < 0)
+    if (! requestSent)
     {
+        pendingTag = -1;
         juce::ScopedLock el (errorLock);
         errorMessage = "Could not send separation request to the worker.";
         state = State::failed;
@@ -327,13 +401,39 @@ void SeparationEngine::run()
         return;
     }
 
-    // Wait until the worker reports done/failed, or we are cancelled.
+    // Wait until the worker acknowledges completion or cancellation. If an
+    // inference backend stops responding, replace the worker instead of
+    // leaving the engine permanently busy.
+    constexpr auto cancellationTimeout = std::chrono::seconds (10);
+    bool cancelForwarded = false;
+    auto cancellationDeadline = std::chrono::steady_clock::time_point::max();
     while (! threadShouldExit())
     {
         if (resultEvent.wait (200))
             break;
-        if (cancelRequested.load())
-            worker.cancelSeparation();
+        if (cancelRequested.load() && ! cancelForwarded)
+        {
+            worker.cancelSeparation (tag);
+            cancelForwarded = true;
+            cancellationDeadline = std::chrono::steady_clock::now() + cancellationTimeout;
+        }
+        if (cancelForwarded && std::chrono::steady_clock::now() >= cancellationDeadline)
+        {
+            pendingTag = -1;
+            state = State::restarting;
+            statusMessage = setStaticStatus ("Restarting Python worker...").toRawUTF8();
+            sendChangeMessage();
+            const bool restarted = worker.restart();
+            if (! restarted)
+            {
+                juce::ScopedLock el (errorLock);
+                errorMessage = "Cancellation timed out and the Python worker could not be restarted.";
+                state = State::failed;
+                statusMessage = setStaticStatus ("Failed").toRawUTF8();
+                sendChangeMessage();
+            }
+            return;
+        }
     }
 
     // Engine state has been updated by separationDone/Failed callback.

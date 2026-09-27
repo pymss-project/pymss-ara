@@ -60,5 +60,5 @@ void PyMSSDocumentController::startWorker()
 
 void PyMSSDocumentController::stopWorker()
 {
-    worker.stop();
+    worker.stop (true);
 }

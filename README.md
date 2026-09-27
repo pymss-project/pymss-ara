@@ -12,8 +12,8 @@ The plugin reads an entire ARA-assigned track, separates it into stems (vocals, 
 - **Dry passthrough before separation** — the original track plays through immediately. Source-to-host sample-rate mismatch is handled with a streaming resampler, so pitch stays correct without changing the project rate.
 - **Background separation** — inference runs in a long-lived Python worker process (`pymss`), keeping the audio thread free. The UI never blocks.
 - **Stem monitor** — after separation, each stem is listed with **Mute** and **Solo** controls. The output bus is the live mix of the active stems.
-- **Model browser** — lists all models in the pymss catalog; already-installed models are listed first, uninstalled ones are auto-downloaded on use (`download=True`).
-- **Inference parameters** — `batch_size`, `overlap_size`, `chunk_size` (0 = use the model default), `normalize`.
+- **Model browser** — the main selector lists installed models only; a searchable, category-filtered download dialog lists missing models with progress reporting.
+- **Architecture-aware inference parameters** — MSS models expose batch/chunk/overlap, TTA, standardization, and output normalization. VR models expose batch/window/aggression, TTA, high-end reconstruction, mask post-processing, its threshold, and output normalization. Installed model defaults are loaded automatically.
 - **Progress + cancel** — real-time progress from the model, with a Cancel button that aborts the in-flight job.
 - **Persistent settings** — Python interpreter path and model directory are stored at `~/.pymss/settings/ara.json`.
 
@@ -30,9 +30,23 @@ cmake -B build -G "Visual Studio 18 2026" -A x64
 cmake --build build --target PyMSS_ARA_VST3 --config Release
 ```
 
+For a non-administrator build that does not install into the system VST3
+directory, configure with `-DPYMSS_COPY_PLUGIN_AFTER_BUILD=OFF`.
+
+JUCE's Windows helper tools may fail when the source path contains non-ASCII
+characters. In that case, configure through a temporary ASCII drive mapping:
+
+```powershell
+subst R: "$PWD"
+cmake -S R:\ -B R:\build-ascii -G "Visual Studio 18 2026" -A x64 `
+  -DPYMSS_COPY_PLUGIN_AFTER_BUILD=OFF
+cmake --build R:\build-ascii --target PyMSS_ARA_VST3 --config Release
+subst R: /d
+```
+
 The build:
 - Produces `build/PyMSS_ARA_artefacts/Release/VST3/PyMSS ARA Plugin.vst3`.
-- With `COPY_PLUGIN_AFTER_BUILD=TRUE` (the default in this project), installs it to `C:\Program Files\Common Files\VST3\`.
+- With `PYMSS_COPY_PLUGIN_AFTER_BUILD=ON` (the default), installs it to `C:\Program Files\Common Files\VST3\`.
 - Copies `python/worker.py` into the bundle's `Contents/Resources/`.
 
 > **Close your DAW before rebuilding.** A loaded VST3 is file-locked by Windows, so the install step silently fails to overwrite it while the DAW is open.
@@ -61,8 +75,8 @@ The Python worker's stderr is redirected to `~/.pymss/logs/worker_stderr.txt` fo
 
 1. **Load the plugin as ARA** on an audio track in an ARA-capable host (e.g. Reaper, Studio One). Make sure to pick the `(ARA)` entry so the host assigns the region to the plugin.
 2. Open the plugin UI. Press **play** — you should hear the original track (dry passthrough).
-3. Pick a model from the dropdown. Uninstalled models are auto-downloaded when you separate.
-4. (Optional) Adjust inference parameters. `0` means "use the model default".
+3. Pick an installed model from the dropdown. Use **Models...** to browse and download missing models; completed downloads are added to the main selector automatically.
+4. (Optional) Adjust the architecture-specific inference parameters. MSS numeric fields use `0` for the model default; VR fields are populated from the model configuration or PyMSS runtime defaults.
 5. Click **Start Separation**. Watch the progress bar; you can **Cancel** at any time.
 6. When finished, the **Stems** panel lists each separated stem with **Mute (M)** and **Solo (S)** buttons. The output is the live mix of the active stems.
 
@@ -102,7 +116,7 @@ pymss-ara/
  │   │   └─ SeparationEngine       background read/separate/cache│
  │   └─ PyMSSAudioProcessorEditor  model picker, params, monitor │
  │                  │                                            │
- │                  │  stdin/stdout binary frames                │
+ │                  │  JSON control frames + named shared memory │
  │                  ▼                                            │
  │  python worker.py  (pymss)                                    │
  │   ├─ list_models / model_info                                 │
@@ -119,17 +133,51 @@ pymss-ara/
 
 ### IPC protocol
 
-A binary framed protocol over the worker's stdin/stdout (see [python/worker.py](python/worker.py) and [src/WorkerProtocol.h](src/WorkerProtocol.h)):
+Protocol v4 separates the control and audio data paths. Commands, progress and
+errors use framed stdin/stdout messages (see [python/worker.py](python/worker.py)
+and [src/ipc/WorkerProtocol.h](src/ipc/WorkerProtocol.h)):
 
 ```
 uint32  headerLen   length of the JSON header
 uint32  bodyLen     length of the binary body
 bytes   headerLen   UTF-8 JSON header (single-line)
-bytes   bodyLen     raw binary payload (interleaved float32 PCM for audio)
+bytes   bodyLen     reserved (zero for the current protocol)
 ```
 
-Requests: `ping`, `check_pymss`, `list_models`, `model_info`, `separate`, `cancel`, `shutdown`.
-Replies/events: `ready`, `result`, `progress`, `error`.
+Separation audio uses per-request Windows named shared memory. Input and output
+samples are planar little-endian float32 with a versioned 64-byte header. The
+C++ side owns each input mapping until a result or error arrives. The Python
+worker owns each output mapping until the client sends `release_buffer`.
+Mapping names include the process, request, and a random nonce so multiple
+plug-in instances can run in the same host without collisions.
+
+The audio transport is identified as `pymss.shared_memory.audio.v2`. Each
+mapping header starts with the ASCII magic `PYMS` and carries the fixed identity
+marker `PYMSS::SHM::V2` in its reserved tail, allowing dumps and diagnostics to
+distinguish PyMSS audio mappings from unrelated shared memory.
+
+Requests: `ping`, `check_pymss`, `list_models`, `model_info`, `download_model`,
+`separate`, `cancel`, `release_buffer`, `shutdown`.
+Replies/events: `ready`, `result`, `progress`, `download_progress`, `error`.
+
+The transport checks mapping sizes, request IDs, channel counts, stem ranges,
+and protocol versions before exposing samples to either side. The maximum
+mapping size is 8 GiB; separation result payloads are limited to 2 GiB and are
+also checked against currently available physical memory before being copied.
+
+### Protocol tests
+
+The model-independent shared-memory tests require Windows and NumPy:
+
+```bash
+python -B -m unittest discover -s tests -v
+cmd.exe /c tests\run_shared_memory_cpp_smoke.cmd
+```
+
+They cover planar input/output layout, copy-on-write input access, invalid
+request rejection, bidirectional C++/Python interoperability, and the native
+Win32 C++ mapping implementation. The C++ smoke script locates the installed
+Visual Studio toolchain through `vswhere` and does not require JUCE or ARA.
 
 ## Prerequisites
 

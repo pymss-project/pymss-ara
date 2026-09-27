@@ -27,7 +27,7 @@ class SeparationEngine : public WorkerClient::Listener,
                          private juce::Thread
 {
 public:
-    enum class State { idle, reading, downloading, separating, done, failed, cancelled };
+    enum class State { idle, reading, downloading, separating, restarting, done, failed, cancelled };
 
     /** sourceReader must fill `out` with the full audio source (channel-major)
         at the source's native sample rate, returning true on success. */
@@ -54,7 +54,8 @@ public:
     State getState() const               { return state.load(); }
     bool isBusy() const                  { return getState() == State::reading
                                                 || getState() == State::downloading
-                                                || getState() == State::separating; }
+                                                || getState() == State::separating
+                                                || getState() == State::restarting; }
     float getProgress() const;
     juce::String getProgressText() const;
     juce::String getStatusMessage() const;
@@ -85,6 +86,7 @@ public:
     void separationProgress (int tag, int done, int total, const juce::String& message) override;
     void separationDone (int tag, std::shared_ptr<StemSet> stems) override;
     void separationFailed (int tag, const juce::String& message, bool cancelled) override;
+    void workerReady (bool pymssOk, const juce::String& version, const juce::String& message) override;
     void workerDied (const juce::String& reason) override;
 
 private:
