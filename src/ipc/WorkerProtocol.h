@@ -3,6 +3,8 @@
 #include <juce_core/juce_core.h>
 #include <cstring>
 
+#include "SharedMemoryRegion.h"
+
 /** Binary framing helpers shared between the C++ WorkerClient and the Python
     worker (see python/worker.py for the matching implementation).
 
@@ -10,14 +12,18 @@
         uint32  headerLen   length of the JSON header in bytes
         uint32  bodyLen     length of the binary body in bytes
         bytes   headerLen   UTF-8 JSON header (single-line)
-        bytes   bodyLen     raw binary payload
+    bytes   bodyLen     optional raw binary payload
 
     Every header carries an integer "id" used to match responses to requests and
-    to attribute progress events.
+    to attribute progress events. Protocol v2 transfers separation audio through
+    named shared memory; pipe bodies are retained only for framing compatibility.
 */
 
 namespace pymss_protocol
 {
+inline constexpr auto controlProtocolVersion = pymss_shm::controlProtocolVersion;
+inline constexpr const char* sharedMemoryTransport = "shared_memory_v1";
+
 using Header = juce::DynamicObject;     // a JSON object
 using HeaderPtr = juce::ReferenceCountedObjectPtr<Header>;
 

@@ -91,8 +91,8 @@ void PyMSSProcessorImpl::processBlock (juce::AudioBuffer<float>& buffer, juce::M
     juce::ScopedNoDenormals noDenormals;
     midi.clear();
 
-    auto* playHead = getPlayHead();
-    if (! processBlockForARA (buffer, isRealtime(), playHead))
+    auto* currentPlayHead = getPlayHead();
+    if (! processBlockForARA (buffer, isRealtime(), currentPlayHead))
     {
         // Not running in ARA mode: nothing to produce.
         buffer.clear();

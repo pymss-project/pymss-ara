@@ -1,14 +1,15 @@
 """PyMSS ARA Plugin worker process.
 
-Talks to the C++ plugin over stdin/stdout using a binary framed protocol.
-All human-readable logging goes to stderr; only frames go to stdout.
+Talks to the C++ plugin using a framed stdin/stdout control protocol and named
+shared memory for separation audio. All human-readable logging goes to stderr;
+only control frames go to stdout.
 
 Frame layout (little-endian, identical in both directions)::
 
     uint32  header_len   # length of the JSON header in bytes
     uint32  body_len     # length of the binary body in bytes
     bytes   header_len   # UTF-8 JSON object
-    bytes   body_len     # raw binary payload
+    bytes   body_len     # reserved; separation audio uses shared memory
 
 Request header fields:
     id      int    request id (mirrored in responses/progress)
@@ -19,15 +20,17 @@ Response / event header fields:
     id      int
     type    str    "result" | "progress" | "error"
 
-The "separate" request carries interleaved float32 PCM in its body and returns
-the stems as concatenated interleaved float32 PCM (one stem after another).
+The "separate" request and result describe planar float32 named mappings. The
+mapping owner keeps each region alive until the peer has completed its access.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import mmap
 import os
+import secrets
 import struct
 import sys
 import threading
@@ -35,6 +38,285 @@ import traceback
 from queue import Queue
 
 import numpy as np
+
+
+# -----------------------------------------------------------------------------
+# Shared-memory protocol. Keep these values in sync with SharedMemoryRegion.h.
+# -----------------------------------------------------------------------------
+
+CONTROL_PROTOCOL_VERSION = 2
+SHARED_MEMORY_TRANSPORT = "shared_memory_v1"
+SHM_MAGIC = 0x4D48534D
+SHM_PROTOCOL_VERSION = 1
+SHM_HEADER_BYTES = 64
+SHM_MAX_BYTES = 8 * 1024 * 1024 * 1024
+SHM_MAX_RESULT_BYTES = 2 * 1024 * 1024 * 1024
+SHM_MAX_CHANNELS = 64
+SHM_MAX_STEMS = 64
+SHM_ROLE_INPUT = 1
+SHM_ROLE_OUTPUT = 2
+SHM_STATE_WRITING = 1
+SHM_STATE_READY = 2
+_SHM_HEADER = struct.Struct("<IIIIQQQII16x")
+
+_MAX_CONTROL_HEADER_BYTES = 8 * 1024 * 1024
+_MAX_CONTROL_BODY_BYTES = 1024 * 1024
+
+
+def _parse_nonnegative_int(value, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be an integer") from exc
+    if parsed < 0:
+        raise ValueError(f"{field} must not be negative")
+    return parsed
+
+
+def _validate_mapping_name(name: str) -> str:
+    if not isinstance(name, str) or not name.startswith("Local\\PyMSS_") or len(name) > 240:
+        raise ValueError("invalid shared memory name")
+    return name
+
+
+def _validate_mapping_size(size: int) -> int:
+    size = _parse_nonnegative_int(size, "mapping_bytes")
+    if size < SHM_HEADER_BYTES or size > SHM_MAX_BYTES:
+        raise ValueError("shared memory size is outside the supported range")
+    return size
+
+
+def _write_mapping_header(shared: mmap.mmap, *, role: int, request_id: int,
+                          payload_bytes: int, frames: int, channels: int,
+                          state: int) -> None:
+    if len(shared) < SHM_HEADER_BYTES or payload_bytes < 0 or payload_bytes > len(shared) - SHM_HEADER_BYTES:
+        raise ValueError("shared memory header does not fit the mapping")
+    shared[:SHM_HEADER_BYTES] = b"\0" * SHM_HEADER_BYTES
+    _SHM_HEADER.pack_into(
+        shared,
+        0,
+        SHM_MAGIC,
+        SHM_PROTOCOL_VERSION,
+        SHM_HEADER_BYTES,
+        role,
+        request_id,
+        payload_bytes,
+        frames,
+        channels,
+        state,
+    )
+
+
+def _read_mapping_header(shared: mmap.mmap, *, expected_role: int,
+                         expected_request_id: int) -> dict:
+    if len(shared) < SHM_HEADER_BYTES:
+        raise ValueError("shared memory mapping is smaller than its header")
+    magic, version, header_bytes, role, request_id, payload_bytes, frames, channels, state = (
+        _SHM_HEADER.unpack_from(shared, 0)
+    )
+    if magic != SHM_MAGIC or version != SHM_PROTOCOL_VERSION or header_bytes != SHM_HEADER_BYTES:
+        raise ValueError("shared memory protocol header is invalid")
+    if role != expected_role or request_id != expected_request_id:
+        raise ValueError("shared memory mapping does not match the request")
+    if state != SHM_STATE_READY:
+        raise ValueError("shared memory mapping is not ready")
+    if payload_bytes > len(shared) - SHM_HEADER_BYTES:
+        raise ValueError("shared memory payload exceeds the mapping")
+    return {
+        "payload_bytes": payload_bytes,
+        "frames": frames,
+        "channels": channels,
+    }
+
+
+class SharedMemoryRegion:
+    def __init__(self, name: str, size: int, access: int):
+        self.name = _validate_mapping_name(name)
+        self.size = _validate_mapping_size(size)
+        self.mapping = mmap.mmap(-1, self.size, tagname=self.name, access=access)
+
+    @classmethod
+    def create(cls, name: str, size: int) -> "SharedMemoryRegion":
+        return cls(name, size, mmap.ACCESS_WRITE)
+
+    @classmethod
+    def open_copy_on_write(cls, name: str, size: int) -> "SharedMemoryRegion":
+        return cls(name, size, mmap.ACCESS_COPY)
+
+    def close(self) -> None:
+        if self.mapping is not None:
+            self.mapping.close()
+            self.mapping = None
+
+    def __enter__(self) -> "SharedMemoryRegion":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback_value) -> None:
+        self.close()
+
+
+def _make_mapping_name(request_id: int, direction: str) -> str:
+    return f"Local\\PyMSS_{os.getpid()}_{request_id}_{secrets.token_hex(8)}_{direction}"
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+def _open_shared_input(header: dict, request_id: int) -> tuple[SharedMemoryRegion, np.ndarray, int]:
+    if int(header.get("protocol_version", 0)) != CONTROL_PROTOCOL_VERSION:
+        raise ValueError("control protocol mismatch")
+    if header.get("transport") != SHARED_MEMORY_TRANSPORT:
+        raise ValueError("unsupported separation transport")
+
+    metadata = header.get("input")
+    if not isinstance(metadata, dict):
+        raise ValueError("shared memory input metadata is missing")
+    if metadata.get("format") != "float32_le" or metadata.get("layout") != "planar":
+        raise ValueError("unsupported shared memory audio format")
+
+    name = _validate_mapping_name(metadata.get("name"))
+    mapping_bytes = _validate_mapping_size(metadata.get("mapping_bytes"))
+    payload_offset = _parse_nonnegative_int(metadata.get("payload_offset"), "payload_offset")
+    payload_bytes = _parse_nonnegative_int(metadata.get("payload_bytes"), "payload_bytes")
+    frames = _parse_nonnegative_int(metadata.get("frames"), "frames")
+    channels = _parse_nonnegative_int(metadata.get("channels"), "channels")
+    sample_rate = _parse_nonnegative_int(metadata.get("sample_rate"), "sample_rate")
+
+    if payload_offset != SHM_HEADER_BYTES or frames <= 0 or channels <= 0 or channels > SHM_MAX_CHANNELS:
+        raise ValueError("invalid shared memory audio dimensions")
+    if sample_rate <= 0 or sample_rate > 768000:
+        raise ValueError("invalid input sample rate")
+    expected_payload_bytes = frames * channels * np.dtype("<f4").itemsize
+    if payload_bytes != expected_payload_bytes or mapping_bytes != SHM_HEADER_BYTES + payload_bytes:
+        raise ValueError("shared memory input size does not match its dimensions")
+
+    region = SharedMemoryRegion.open_copy_on_write(name, mapping_bytes)
+    try:
+        mapping_header = _read_mapping_header(
+            region.mapping,
+            expected_role=SHM_ROLE_INPUT,
+            expected_request_id=request_id,
+        )
+        if (
+            mapping_header["payload_bytes"] != payload_bytes
+            or mapping_header["frames"] != frames
+            or mapping_header["channels"] != channels
+        ):
+            raise ValueError("shared memory input header does not match its metadata")
+        audio = np.ndarray(
+            (channels, frames),
+            dtype="<f4",
+            buffer=region.mapping,
+            offset=SHM_HEADER_BYTES,
+            order="C",
+        )
+        return region, audio, sample_rate
+    except Exception:
+        region.close()
+        raise
+
+
+def _create_shared_output(request_id: int, sample_rate: int,
+                          stem_names: list[str], stem_arrays: list[np.ndarray]) -> tuple[dict, SharedMemoryRegion]:
+    if not stem_names or len(stem_names) != len(stem_arrays) or len(stem_names) > SHM_MAX_STEMS:
+        raise ValueError("invalid stem output list")
+    if sample_rate <= 0 or sample_rate > 768000:
+        raise ValueError("invalid output sample rate")
+
+    descriptors = []
+    offset = 0
+    for name, array in zip(stem_names, stem_arrays):
+        if not isinstance(name, str) or not name or len(name) > 256:
+            raise ValueError("stem name must not be empty")
+        arr = np.asarray(array, dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr[:, np.newaxis]
+        if arr.ndim != 2 or arr.shape[0] <= 0 or arr.shape[1] <= 0 or arr.shape[1] > SHM_MAX_CHANNELS:
+            raise ValueError(f"invalid shape for stem {name!r}")
+
+        frames, channels = arr.shape
+        offset = _align_up(offset, 64)
+        byte_count = int(frames) * int(channels) * np.dtype("<f4").itemsize
+        if offset + byte_count > SHM_MAX_RESULT_BYTES:
+            raise ValueError("shared memory output exceeds the supported size")
+        descriptors.append({
+            "name": name,
+            "array": arr,
+            "offset_bytes": offset,
+            "frames": int(frames),
+            "channels": int(channels),
+        })
+        offset += byte_count
+
+    payload_bytes = offset
+    mapping_bytes = SHM_HEADER_BYTES + payload_bytes
+    mapping_name = _make_mapping_name(request_id, "output")
+    region = SharedMemoryRegion.create(mapping_name, mapping_bytes)
+    try:
+        _write_mapping_header(
+            region.mapping,
+            role=SHM_ROLE_OUTPUT,
+            request_id=request_id,
+            payload_bytes=payload_bytes,
+            frames=0,
+            channels=0,
+            state=SHM_STATE_WRITING,
+        )
+
+        stem_metadata = []
+        for descriptor in descriptors:
+            array = descriptor["array"]
+            channel_bytes = descriptor["frames"] * np.dtype("<f4").itemsize
+            for channel in range(descriptor["channels"]):
+                channel_offset = SHM_HEADER_BYTES + descriptor["offset_bytes"] + channel * channel_bytes
+                target = np.ndarray(
+                    (descriptor["frames"],),
+                    dtype="<f4",
+                    buffer=region.mapping,
+                    offset=channel_offset,
+                )
+                target[:] = array[:, channel]
+                del target
+
+            stem_metadata.append({
+                "name": descriptor["name"],
+                "offset_bytes": str(descriptor["offset_bytes"]),
+                "frames": str(descriptor["frames"]),
+                "channels": descriptor["channels"],
+                "layout": "planar",
+            })
+
+        _write_mapping_header(
+            region.mapping,
+            role=SHM_ROLE_OUTPUT,
+            request_id=request_id,
+            payload_bytes=payload_bytes,
+            frames=0,
+            channels=0,
+            state=SHM_STATE_READY,
+        )
+
+        response = {
+            "id": request_id,
+            "type": "result",
+            "protocol_version": CONTROL_PROTOCOL_VERSION,
+            "transport": SHARED_MEMORY_TRANSPORT,
+            "sample_rate": sample_rate,
+            "output": {
+                "name": mapping_name,
+                "mapping_bytes": str(mapping_bytes),
+                "payload_offset": SHM_HEADER_BYTES,
+                "payload_bytes": str(payload_bytes),
+            },
+            "stems": stem_metadata,
+        }
+        return response, region
+    except Exception:
+        region.close()
+        raise
 
 
 def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
@@ -96,6 +378,8 @@ def read_frame() -> tuple[dict, bytes]:
     """Read a single frame from stdin. Blocks until a full frame is available."""
     header_len = struct.unpack("<I", _read_exactly(_FD_IN, 4))[0]
     body_len = struct.unpack("<I", _read_exactly(_FD_IN, 4))[0]
+    if header_len > _MAX_CONTROL_HEADER_BYTES or body_len > _MAX_CONTROL_BODY_BYTES:
+        raise ValueError("control frame exceeds the protocol limit")
     header_bytes = _read_exactly(_FD_IN, header_len)
     body = _read_exactly(_FD_IN, body_len) if body_len else b""
     header = json.loads(header_bytes.decode("utf-8"))
@@ -135,9 +419,11 @@ class Worker:
     """
 
     def __init__(self) -> None:
-        self._cancel_event = threading.Event()
+        self._cancel_lock = threading.Lock()
+        self._cancelled_jobs: set[int] = set()
         self._job_id: int | None = None
         self._in_queue: Queue = Queue()
+        self._output_regions: dict[int, SharedMemoryRegion] = {}
 
     # -- pymss availability ---------------------------------------------------
 
@@ -241,8 +527,7 @@ class Worker:
 
     def _progress_callback(self, done, total, message):
         # Abort if the current job was cancelled.
-        if self._cancel_event.is_set():
-            raise CancelledError("separation cancelled")
+        self._raise_if_cancelled(self._job_id)
         try:
             write_frame({
                 "id": self._job_id,
@@ -257,10 +542,14 @@ class Worker:
     # -- separation -----------------------------------------------------------
 
     def separate(self, request_id: int, header: dict, body: bytes) -> tuple[dict, bytes]:
+        if body:
+            raise ValueError("separation audio must use shared memory")
+        if self._output_regions:
+            log("Releasing an unacknowledged output buffer")
+            self.release_all_outputs()
+
         model_name = header["model"]
         model_dir = header.get("model_dir") or None
-        sample_rate = int(header["sample_rate"])
-        channels = int(header.get("channels", 2))
 
         def _to_none_if_zero(v):
             return None if (v is None or int(v) <= 0) else int(v)
@@ -272,32 +561,37 @@ class Worker:
             "normalize": bool(header.get("normalize", False)),
         }
 
-        self._cancel_event.clear()
         self._job_id = request_id
+        self._discard_stale_cancellations(request_id)
+        self._raise_if_cancelled(request_id)
 
-        # Decode interleaved float32 body -> (channels, frames).
-        raw = np.frombuffer(body, dtype="<f4")
-        frames = raw.size // max(1, channels)
-        raw = raw[: frames * channels]
-        mix = np.ascontiguousarray(raw.reshape(frames, channels).T.astype(np.float32))
+        input_region, shared_mix, sample_rate = _open_shared_input(header, request_id)
+        mix = shared_mix
+        frames = int(shared_mix.shape[-1])
+        channels = int(shared_mix.shape[0])
+        try:
+            # A fresh separator is used for every request. MSSeparator's context
+            # manager calls close() on exit, including when inference raises.
+            with self._create_separator(model_name, model_dir, inference_params) as separator:
+                log("Model loaded")
 
-        # A fresh separator is used for every request.  MSSeparator's context
-        # manager calls close() on exit, including when inference raises.
-        with self._create_separator(model_name, model_dir, inference_params) as separator:
-            log("Model loaded")
+                # Resample input to the model's design sample rate if needed.
+                model_sr = self._model_sample_rate(separator)
+                input_sr = sample_rate
+                if model_sr and model_sr != sample_rate:
+                    log(f"Resampling input {sample_rate} -> {model_sr} ({frames} frames)")
+                    self._progress_callback(0, 1, "Resampling input for model...")
+                    mix = resample_audio(mix, sample_rate, model_sr)
+                    input_sr = model_sr
 
-            # Resample input to the model's design sample rate if needed.
-            model_sr = self._model_sample_rate(separator)
-            input_sr = sample_rate
-            if model_sr and model_sr != sample_rate:
-                log(f"Resampling input {sample_rate} -> {model_sr} ({frames} frames)")
-                self._progress_callback(0, 1, "Resampling input for model...")
-                mix = resample_audio(mix, sample_rate, model_sr)
-                input_sr = model_sr
-
-            log(f"Separating {mix.shape[-1]} frames @ {input_sr} Hz, channels={channels}")
-            self._progress_callback(0, 1, "Running separation...")
-            results = separator.separate(mix, pbar=False)
+                log(f"Separating {mix.shape[-1]} frames @ {input_sr} Hz, channels={channels}")
+                self._progress_callback(0, 1, "Running separation...")
+                results = separator.separate(mix, pbar=False)
+                self._raise_if_cancelled(request_id)
+        finally:
+            del mix
+            del shared_mix
+            input_region.close()
 
         log("Model released")
 
@@ -305,10 +599,11 @@ class Worker:
         stem_names = list(results.keys())
 
         # pymss returns stems sample-major as (frames, channels). Resample along
-        # the time axis if we resampled the input, then pack interleaved.
+        # the time axis if we resampled the input, then publish planar buffers.
         out_sr = input_sr
         stem_arrays = []
         for name in stem_names:
+            self._raise_if_cancelled(request_id)
             arr = np.asarray(results[name], dtype=np.float32)
             if arr.ndim == 1:
                 arr = arr[:, np.newaxis]          # (frames, 1)
@@ -317,22 +612,18 @@ class Worker:
                 arr = resample_audio(arr.T, out_sr, sample_rate).T
             stem_arrays.append(arr)
 
-        # Pack stems as concatenated interleaved float32 (f0c0, f0c1, f1c0, ...).
-        body_chunks = []
-        stem_meta = []
-        for name, arr in zip(stem_names, stem_arrays):
-            n_fr, n_ch = arr.shape                # (frames, channels)
-            interleaved = np.ascontiguousarray(arr, dtype="<f4").reshape(-1)
-            body_chunks.append(interleaved.tobytes())
-            stem_meta.append({"name": name, "channels": int(n_ch), "frames": int(n_fr)})
-
-        response_header = {
-            "id": request_id,
-            "type": "result",
-            "sample_rate": sample_rate,
-            "stems": stem_meta,
-        }
-        return response_header, b"".join(body_chunks)
+        response_header, output_region = _create_shared_output(
+            request_id,
+            sample_rate,
+            stem_names,
+            stem_arrays,
+        )
+        if self.is_cancelled(request_id):
+            output_region.close()
+            raise CancelledError("separation cancelled")
+        self.release_output(request_id)
+        self._output_regions[request_id] = output_region
+        return response_header, b""
 
     def _model_sample_rate(self, separator):
         try:
@@ -347,14 +638,48 @@ class Worker:
 
     # -- lifecycle -----------------------------------------------------------
 
-    def cancel(self) -> None:
-        self._cancel_event.set()
-        log("Cancel requested")
+    def cancel(self, request_id: int) -> None:
+        if request_id <= 0:
+            return
+        with self._cancel_lock:
+            self._cancelled_jobs.add(request_id)
+        log(f"Cancel requested for job {request_id}")
+
+    def is_cancelled(self, request_id: int | None) -> bool:
+        if request_id is None:
+            return False
+        with self._cancel_lock:
+            return request_id in self._cancelled_jobs
+
+    def _raise_if_cancelled(self, request_id: int | None) -> None:
+        if self.is_cancelled(request_id):
+            raise CancelledError("separation cancelled")
+
+    def _discard_stale_cancellations(self, request_id: int) -> None:
+        with self._cancel_lock:
+            self._cancelled_jobs = {
+                cancelled_id for cancelled_id in self._cancelled_jobs
+                if cancelled_id >= request_id
+            }
+
+    def clear_cancel(self, request_id: int) -> None:
+        with self._cancel_lock:
+            self._cancelled_jobs.discard(request_id)
+
+    def release_output(self, request_id: int) -> None:
+        region = self._output_regions.pop(request_id, None)
+        if region is not None:
+            region.close()
+
+    def release_all_outputs(self) -> None:
+        for region in self._output_regions.values():
+            region.close()
+        self._output_regions.clear()
 
     def shutdown(self) -> None:
         # Separators are scoped to individual separation requests, so there is
         # no model instance to release when the worker exits.
-        return None
+        self.release_all_outputs()
 
 
 # -----------------------------------------------------------------------------
@@ -373,7 +698,7 @@ def main() -> int:
                 header, body = read_frame()
                 cmd = header.get("cmd")
                 if cmd == "cancel":
-                    worker.cancel()
+                    worker.cancel(int(header.get("id", 0)))
                     continue
                 if cmd == "shutdown":
                     worker._in_queue.put(("shutdown", header, body))
@@ -389,7 +714,13 @@ def main() -> int:
 
     # Announce readiness and the pymss import state.
     pymss_state = worker.check_pymss()
-    write_frame({"id": 0, "type": "ready", **pymss_state})
+    write_frame({
+        "id": 0,
+        "type": "ready",
+        "protocol_version": CONTROL_PROTOCOL_VERSION,
+        "capabilities": [SHARED_MEMORY_TRANSPORT],
+        **pymss_state,
+    })
 
     while True:
         try:
@@ -410,6 +741,10 @@ def main() -> int:
 
         if cmd == "check_pymss":
             write_frame({"id": request_id, "type": "result", **worker.check_pymss()})
+            continue
+
+        if cmd == "release_buffer":
+            worker.release_output(request_id)
             continue
 
         if cmd == "list_models":
@@ -434,11 +769,13 @@ def main() -> int:
                 resp_header, resp_body = worker.separate(request_id, header, body)
                 write_frame(resp_header, resp_body)
             except CancelledError:
+                worker.release_output(request_id)
                 write_frame({"id": request_id, "type": "error", "error_type": "cancelled", "message": "cancelled"})
             except Exception as exc:  # noqa: BLE001
+                worker.release_output(request_id)
                 write_frame({"id": request_id, "type": "error", "error_type": "separation_failed", "message": _format_exc(exc)})
             finally:
-                worker._cancel_event.clear()
+                worker.clear_cancel(request_id)
                 worker._job_id = None
             continue
 

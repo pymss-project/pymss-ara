@@ -508,14 +508,34 @@ void PyMSSAudioProcessorEditor::updateStartButtonText()
     }
 
     auto& engine = dc->getEngine();
-    if (engine.isBusy())
+    settingsButton.setEnabled (! engine.isBusy());
+    if (engine.getState() == SeparationEngine::State::restarting)
+    {
+        startButton.setButtonText ("Restarting...");
+        startButton.setEnabled (false);
+    }
+    else if (! dc->getWorker().isReady())
+    {
+        startButton.setButtonText ("Worker unavailable");
+        startButton.setEnabled (false);
+    }
+    else if (engine.isBusy())
+    {
         startButton.setButtonText ("Cancel");
+        startButton.setEnabled (true);
+    }
     else if (engine.getState() == SeparationEngine::State::done
              || (processor.getPrimaryAudioSource() != nullptr
                  && engine.hasStemsForSource (processor.getPrimaryAudioSource()->getPersistentID())))
+    {
         startButton.setButtonText ("Re-separate");
+        startButton.setEnabled (true);
+    }
     else
+    {
         startButton.setButtonText ("Start Separation");
+        startButton.setEnabled (true);
+    }
 }
 
 void PyMSSAudioProcessorEditor::updateProgressDisplay()
@@ -533,6 +553,7 @@ void PyMSSAudioProcessorEditor::updateProgressDisplay()
         case SeparationEngine::State::reading:     text = "Reading audio source..."; break;
         case SeparationEngine::State::downloading: text = "Downloading model..."; break;
         case SeparationEngine::State::separating:  text = engine.getStatusMessage() + "  (" + engine.getProgressText() + ")"; break;
+        case SeparationEngine::State::restarting:  text = "Restarting Python worker..."; break;
         case SeparationEngine::State::done:        text = "Separation complete"; break;
         case SeparationEngine::State::failed:      text = "Failed: " + engine.getErrorMessage(); break;
         case SeparationEngine::State::cancelled:   text = "Cancelled"; break;

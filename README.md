@@ -30,9 +30,23 @@ cmake -B build -G "Visual Studio 18 2026" -A x64
 cmake --build build --target PyMSS_ARA_VST3 --config Release
 ```
 
+For a non-administrator build that does not install into the system VST3
+directory, configure with `-DPYMSS_COPY_PLUGIN_AFTER_BUILD=OFF`.
+
+JUCE's Windows helper tools may fail when the source path contains non-ASCII
+characters. In that case, configure through a temporary ASCII drive mapping:
+
+```powershell
+subst R: "$PWD"
+cmake -S R:\ -B R:\build-ascii -G "Visual Studio 18 2026" -A x64 `
+  -DPYMSS_COPY_PLUGIN_AFTER_BUILD=OFF
+cmake --build R:\build-ascii --target PyMSS_ARA_VST3 --config Release
+subst R: /d
+```
+
 The build:
 - Produces `build/PyMSS_ARA_artefacts/Release/VST3/PyMSS ARA Plugin.vst3`.
-- With `COPY_PLUGIN_AFTER_BUILD=TRUE` (the default in this project), installs it to `C:\Program Files\Common Files\VST3\`.
+- With `PYMSS_COPY_PLUGIN_AFTER_BUILD=ON` (the default), installs it to `C:\Program Files\Common Files\VST3\`.
 - Copies `python/worker.py` into the bundle's `Contents/Resources/`.
 
 > **Close your DAW before rebuilding.** A loaded VST3 is file-locked by Windows, so the install step silently fails to overwrite it while the DAW is open.
@@ -102,7 +116,7 @@ pymss-ara/
  │   │   └─ SeparationEngine       background read/separate/cache│
  │   └─ PyMSSAudioProcessorEditor  model picker, params, monitor │
  │                  │                                            │
- │                  │  stdin/stdout binary frames                │
+ │                  │  JSON control frames + named shared memory │
  │                  ▼                                            │
  │  python worker.py  (pymss)                                    │
  │   ├─ list_models / model_info                                 │
@@ -119,17 +133,46 @@ pymss-ara/
 
 ### IPC protocol
 
-A binary framed protocol over the worker's stdin/stdout (see [python/worker.py](python/worker.py) and [src/WorkerProtocol.h](src/WorkerProtocol.h)):
+Protocol v2 separates the control and audio data paths. Commands, progress and
+errors use framed stdin/stdout messages (see [python/worker.py](python/worker.py)
+and [src/ipc/WorkerProtocol.h](src/ipc/WorkerProtocol.h)):
 
 ```
 uint32  headerLen   length of the JSON header
 uint32  bodyLen     length of the binary body
 bytes   headerLen   UTF-8 JSON header (single-line)
-bytes   bodyLen     raw binary payload (interleaved float32 PCM for audio)
+bytes   bodyLen     reserved (zero for the current protocol)
 ```
 
-Requests: `ping`, `check_pymss`, `list_models`, `model_info`, `separate`, `cancel`, `shutdown`.
+Separation audio uses per-request Windows named shared memory. Input and output
+samples are planar little-endian float32 with a versioned 64-byte header. The
+C++ side owns each input mapping until a result or error arrives. The Python
+worker owns each output mapping until the client sends `release_buffer`.
+Mapping names include the process, request, and a random nonce so multiple
+plug-in instances can run in the same host without collisions.
+
+Requests: `ping`, `check_pymss`, `list_models`, `model_info`, `separate`,
+`cancel`, `release_buffer`, `shutdown`.
 Replies/events: `ready`, `result`, `progress`, `error`.
+
+The transport checks mapping sizes, request IDs, channel counts, stem ranges,
+and protocol versions before exposing samples to either side. The maximum
+mapping size is 8 GiB; separation result payloads are limited to 2 GiB and are
+also checked against currently available physical memory before being copied.
+
+### Protocol tests
+
+The model-independent shared-memory tests require Windows and NumPy:
+
+```bash
+python -B -m unittest discover -s tests -v
+cmd.exe /c tests\run_shared_memory_cpp_smoke.cmd
+```
+
+They cover planar input/output layout, copy-on-write input access, invalid
+request rejection, bidirectional C++/Python interoperability, and the native
+Win32 C++ mapping implementation. The C++ smoke script locates the installed
+Visual Studio toolchain through `vswhere` and does not require JUCE or ARA.
 
 ## Prerequisites
 
